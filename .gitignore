@@ -1,0 +1,25 @@
+# Environment
+.env
+*.local
+
+# Compiled binaries and directories
+/bin/
+api_server
+worker_server
+infra_check
+api
+
+# Test and runtime artifacts
+dummy_upload.txt
+downloaded.txt
+*.log
+
+# IDE and Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS attributes
+.DS_Store
+Thumbs.db
