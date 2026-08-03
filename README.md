@@ -45,7 +45,7 @@ graph LR
     MainStream -->|XReadGroup| Worker["Worker Node (PID Consumer)"]
     Worker -->|Attempt Success| ACK["XAck (Remove from PEL)"]
     Worker -->|Max Retries Exceeded| DLQ["Stream: nimbus:dead-letters"]
-    PEL["Pending Entries List"] -->|XAutoClaim (Stale > 5m)| Worker
+    PEL["Pending Entries List"] -->|XAutoClaim Stale over 5m| Worker
 ```
 
 ### 3. Distributed Tracing & Observability
