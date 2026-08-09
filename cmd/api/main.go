@@ -43,7 +43,7 @@ func main() {
 	}
 
 	// 1. Initialize Infrastructure
-	dbPool, err := database.New(cfg.DatabaseURL)
+	dbPool, err := database.New(cfg.DatabaseURL, cfg.DBMaxConns)
 	if err != nil {
 		slog.Error("unable to connect to database", "error", err)
 		os.Exit(1)

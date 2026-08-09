@@ -159,10 +159,10 @@ func (r *repository) ListFiles(ctx context.Context, userID string, folderID *str
 	var err error
 
 	if folderID == nil {
-		query = `SELECT id, user_id, folder_id, name, content_type, size, status, created_at, updated_at FROM files WHERE user_id = $1 AND folder_id IS NULL`
+		query = `SELECT id, user_id, folder_id, name, content_type, size, status, created_at, updated_at FROM files WHERE user_id = $1 AND folder_id IS NULL AND status = 'ready'`
 		rows, err = r.db.Query(ctx, query, userID)
 	} else {
-		query = `SELECT id, user_id, folder_id, name, content_type, size, status, created_at, updated_at FROM files WHERE user_id = $1 AND folder_id = $2`
+		query = `SELECT id, user_id, folder_id, name, content_type, size, status, created_at, updated_at FROM files WHERE user_id = $1 AND folder_id = $2 AND status = 'ready'`
 		rows, err = r.db.Query(ctx, query, userID, *folderID)
 	}
 
@@ -200,6 +200,7 @@ func (r *repository) SearchFiles(ctx context.Context, userID string, searchQuery
 		FROM files f
 		LEFT JOIN file_embeddings fe ON f.id = fe.file_id
 		WHERE f.user_id = $1
+		  AND f.status = 'ready'
 		  AND (f.name ILIKE '%' || $3 || '%'
 		       OR fe.embedding @> json_build_object('tags', json_build_array($2))::jsonb
 		       OR fe.embedding->>'summary' ILIKE '%' || $3 || '%'

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -11,6 +12,8 @@ import (
 type Config struct {
 	// Database
 	DatabaseURL string
+	// DBMaxConns caps the pgx pool. 0 selects the package default.
+	DBMaxConns int32
 
 	// MinIO / Object Storage
 	MinIOEndpoint  string
@@ -41,6 +44,7 @@ type Config struct {
 func Load() *Config {
 	return &Config{
 		DatabaseURL:      getEnv("DATABASE_URL", "postgres://nimbus:password@localhost:5432/nimbus_db?sslmode=disable"),
+		DBMaxConns:       int32(getEnvInt("DB_MAX_CONNS", 0)),
 		MinIOEndpoint:    getEnv("MINIO_ENDPOINT", "localhost:9000"),
 		MinIOAccessKey:   getEnv("MINIO_ACCESS_KEY", "minioadmin"),
 		MinIOSecretKey:   getEnv("MINIO_SECRET_KEY", "minioadmin"),
@@ -86,6 +90,19 @@ func (c *Config) ValidateForAPI() error {
 		return fmt.Errorf("JWT_SECRET must be at least %d characters, got %d: generate one with `openssl rand -base64 48`", MinJWTSecretLength, len(c.JWTSecret))
 	}
 	return nil
+}
+
+// getEnvInt reads an integer environment variable, falling back when unset or unparseable.
+func getEnvInt(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
 }
 
 // getEnvList reads a comma-separated environment variable into a slice, dropping empty

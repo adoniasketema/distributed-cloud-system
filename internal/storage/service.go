@@ -114,18 +114,10 @@ func (s *service) UploadFile(ctx context.Context, userID string, folderID *strin
 		}
 	}
 
-	tx, err := s.repo.BeginTx(ctx)
-	if err != nil {
-		return "", fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	txRepo := s.repo.WithTx(tx)
-
 	buffer := make([]byte, ChunkSize)
-	n, err := io.ReadFull(fileReader, buffer)
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return "", fmt.Errorf("error reading initial file stream: %w", err)
+	n, readErr := io.ReadFull(fileReader, buffer)
+	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+		return "", fmt.Errorf("error reading initial file stream: %w", readErr)
 	}
 
 	contentType := "application/octet-stream"
@@ -133,12 +125,45 @@ func (s *service) UploadFile(ctx context.Context, userID string, folderID *strin
 		contentType = http.DetectContentType(buffer[:n])
 	}
 
-	// Create the file record with initial 0 size and detected content type
-	fileID, createErr := txRepo.CreateFile(ctx, userID, folderID, name, contentType, 0)
-	if createErr != nil {
-		return "", fmt.Errorf("failed to create file record: %w", createErr)
+	// The file row is committed up front as StatusUploading rather than being held in an
+	// open transaction for the duration of the upload. Wrapping the whole transfer in one
+	// transaction pinned a pooled connection for as long as the client took to send up to
+	// 100MB and MinIO took to accept it; a handful of slow uploaders could exhaust the pool
+	// and stall every other request, logins included. Only chunk writes are transactional
+	// now, so connection hold time is bounded by one chunk instead of one file.
+	//
+	// The cost is that a failed upload leaves a row behind instead of vanishing on rollback.
+	// That is why the status exists: nothing surfaces a file until it reaches StatusReady,
+	// the failure path deletes the row, and RunGarbageCollection sweeps whatever a crash
+	// leaves stranded.
+	fileID, err := s.repo.CreateFile(ctx, userID, folderID, name, contentType, 0)
+	if err != nil {
+		return "", fmt.Errorf("failed to create file record: %w", err)
 	}
 
+	totalSize, err := s.storeChunks(ctx, fileID, fileReader, buffer, n, readErr)
+	if err != nil {
+		s.abandonUpload(ctx, userID, fileID)
+		return "", err
+	}
+
+	// Publishing the file as ready is the commit point for the upload as a whole.
+	if err := s.repo.UpdateFileSizeAndStatus(ctx, fileID, totalSize, StatusReady); err != nil {
+		s.abandonUpload(ctx, userID, fileID)
+		return "", fmt.Errorf("failed to update file size and status: %w", err)
+	}
+
+	// Publish an event for background workers
+	if s.publisher != nil {
+		_ = s.publisher.PublishFileUploaded(ctx, fileID)
+	}
+
+	return fileID, nil
+}
+
+// storeChunks consumes the rest of the stream, writing each chunk, and returns the total
+// number of bytes stored. buffer already holds the first n bytes, read with readErr.
+func (s *service) storeChunks(ctx context.Context, fileID string, fileReader io.Reader, buffer []byte, n int, readErr error) (int64, error) {
 	chunkIndex := 0
 	var totalSize int64
 
@@ -150,51 +175,68 @@ func (s *service) UploadFile(ctx context.Context, userID string, folderID *strin
 		hashBytes := sha256.Sum256(chunkData)
 		hashStr := hex.EncodeToString(hashBytes[:])
 
-		// Atomically get or create chunk (Deduplication without TOCTOU race)
-		chunkID, isNew, dbErr := txRepo.GetOrCreateChunk(ctx, hashStr, int64(n))
-		if dbErr != nil {
-			return "", fmt.Errorf("failed to get or create chunk: %w", dbErr)
-		}
-
-		if isNew {
-			uploadErr := s.store.UploadChunk(ctx, hashStr, bytes.NewReader(chunkData), int64(n))
-			if uploadErr != nil {
-				return "", fmt.Errorf("failed to upload chunk to storage: %w", uploadErr)
-			}
-		}
-
-		// Link chunk to file
-		linkErr := txRepo.LinkFileChunk(ctx, fileID, chunkID, chunkIndex)
-		if linkErr != nil {
-			return "", fmt.Errorf("failed to link chunk to file: %w", linkErr)
+		if err := s.storeChunk(ctx, fileID, hashStr, chunkData, chunkIndex); err != nil {
+			return 0, err
 		}
 
 		chunkIndex++
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
+		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
 			break
 		}
-		n, err = io.ReadFull(fileReader, buffer)
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-			return "", fmt.Errorf("error reading subsequent file stream: %w", err)
+		n, readErr = io.ReadFull(fileReader, buffer)
+		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+			return 0, fmt.Errorf("error reading subsequent file stream: %w", readErr)
 		}
 	}
 
-	// Update file size and status to 'ready' in DB
-	err = txRepo.UpdateFileSizeAndStatus(ctx, fileID, totalSize, "ready")
+	return totalSize, nil
+}
+
+// storeChunk deduplicates, uploads and links a single chunk.
+//
+// The transaction spans the object upload deliberately. GetOrCreateChunk takes FOR SHARE on
+// an existing chunk row, and that lock is what stops the garbage collector deleting the
+// backing object while we are deciding to reuse it - releasing it before the link would
+// reopen the race this handshake exists to close. Holding a connection across one chunk's
+// upload is the price; holding one across the entire file's upload was the bug.
+func (s *service) storeChunk(ctx context.Context, fileID, hash string, data []byte, index int) error {
+	tx, err := s.repo.BeginTx(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to update file size and status: %w", err)
+		return fmt.Errorf("failed to begin chunk transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	txRepo := s.repo.WithTx(tx)
+
+	// Atomically get or create chunk (Deduplication without TOCTOU race)
+	chunkID, isNew, err := txRepo.GetOrCreateChunk(ctx, hash, int64(len(data)))
+	if err != nil {
+		return fmt.Errorf("failed to get or create chunk: %w", err)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return "", fmt.Errorf("failed to commit upload transaction: %w", err)
+	if isNew {
+		if err := s.store.UploadChunk(ctx, hash, bytes.NewReader(data), int64(len(data))); err != nil {
+			return fmt.Errorf("failed to upload chunk to storage: %w", err)
+		}
 	}
 
-	// Publish an event for background workers
-	if s.publisher != nil {
-		_ = s.publisher.PublishFileUploaded(ctx, fileID)
+	if err := txRepo.LinkFileChunk(ctx, fileID, chunkID, index); err != nil {
+		return fmt.Errorf("failed to link chunk to file: %w", err)
 	}
 
-	return fileID, nil
+	return tx.Commit(ctx)
+}
+
+// abandonUpload removes the record of an upload that did not finish.
+//
+// Best effort by design: it runs on a path where something has already gone wrong, and its
+// own failure must not mask the original error. RunGarbageCollection sweeps anything left
+// behind, which is also what covers the case where the process dies before reaching here.
+func (s *service) abandonUpload(ctx context.Context, userID, fileID string) {
+	if err := s.repo.DeleteFile(ctx, userID, fileID); err != nil {
+		tracing.Logger(ctx).Error("failed to clean up abandoned upload; garbage collection will retry",
+			"error", err, "file_id", fileID, "user_id", userID)
+	}
 }
 
 func (s *service) DownloadFile(ctx context.Context, userID string, fileID string) (io.Reader, FileInfo, error) {
@@ -206,6 +248,13 @@ func (s *service) DownloadFile(ctx context.Context, userID string, fileID string
 	info, err := s.repo.GetFileInfo(ctx, fileID)
 	if err != nil {
 		return nil, FileInfo{}, fmt.Errorf("failed to retrieve file info: %w", err)
+	}
+
+	// A row that has not reached StatusReady has an incomplete chunk list, so serving it
+	// would hand back a silently truncated file. Report it as absent, which is what it is
+	// from the caller's point of view.
+	if info.Status != StatusReady {
+		return nil, FileInfo{}, ErrFileNotFound
 	}
 
 	chunks, err := s.repo.GetFileChunks(ctx, fileID)
@@ -266,6 +315,15 @@ func (s *service) DownloadFileInternal(ctx context.Context, fileID string) (io.R
 
 func (s *service) RunGarbageCollection(ctx context.Context, minAge time.Duration) error {
 	logger := tracing.Logger(ctx)
+
+	// Sweep abandoned uploads first. Their file_chunks rows cascade away, which is what
+	// makes the chunks they held eligible for the orphan scan below.
+	if swept, err := s.repo.DeleteStaleUploads(ctx, minAge); err != nil {
+		// Not fatal: chunk collection is independent and still worth running.
+		logger.Error("failed to sweep stale uploads", "error", err)
+	} else if swept > 0 {
+		logger.Info("removed uploads abandoned before completion", "count", swept)
+	}
 
 	orphaned, err := s.repo.GetOrphanedChunks(ctx, minAge)
 	if err != nil {

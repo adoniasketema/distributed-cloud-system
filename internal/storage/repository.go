@@ -25,10 +25,20 @@ type Chunk struct {
 	Size int64
 }
 
+// File lifecycle states.
+const (
+	// StatusUploading marks a row whose bytes are still being written. Rows in this state
+	// are invisible to listings, search and download, and are swept if abandoned.
+	StatusUploading = "uploading"
+	// StatusReady marks a complete, readable file.
+	StatusReady = "ready"
+)
+
 // FileInfo carries the response metadata for a download.
 type FileInfo struct {
 	Name        string
 	ContentType string
+	Status      string
 }
 
 // DBTX is an interface that both *pgxpool.Pool and pgx.Tx satisfy, allowing the same
@@ -58,6 +68,7 @@ type Repository interface {
 	GetOrphanedChunks(ctx context.Context, minAge time.Duration) ([]Chunk, error)
 	LockOrphanedChunk(ctx context.Context, chunkID string) error
 	DeleteChunkRecord(ctx context.Context, chunkID string) error
+	DeleteStaleUploads(ctx context.Context, minAge time.Duration) (int64, error)
 }
 
 type repository struct {
@@ -81,11 +92,11 @@ func (r *repository) WithTx(tx pgx.Tx) Repository {
 func (r *repository) CreateFile(ctx context.Context, userID string, folderID *string, name string, contentType string, size int64) (string, error) {
 	query := `
 		INSERT INTO files (user_id, folder_id, name, content_type, size, status)
-		VALUES ($1, $2, $3, $4, $5, 'uploading')
+		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id
 	`
 	var fileID string
-	err := r.db.QueryRow(ctx, query, userID, folderID, name, contentType, size).Scan(&fileID)
+	err := r.db.QueryRow(ctx, query, userID, folderID, name, contentType, size, StatusUploading).Scan(&fileID)
 	if err != nil {
 		return "", err
 	}
@@ -93,9 +104,9 @@ func (r *repository) CreateFile(ctx context.Context, userID string, folderID *st
 }
 
 func (r *repository) GetFileInfo(ctx context.Context, fileID string) (FileInfo, error) {
-	query := `SELECT name, content_type FROM files WHERE id = $1`
+	query := `SELECT name, content_type, status FROM files WHERE id = $1`
 	var info FileInfo
-	err := r.db.QueryRow(ctx, query, fileID).Scan(&info.Name, &info.ContentType)
+	err := r.db.QueryRow(ctx, query, fileID).Scan(&info.Name, &info.ContentType, &info.Status)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return FileInfo{}, ErrFileNotFound
@@ -281,6 +292,21 @@ func (r *repository) GetOrphanedChunks(ctx context.Context, minAge time.Duration
 		chunks = append(chunks, c)
 	}
 	return chunks, nil
+}
+
+// DeleteStaleUploads removes file rows abandoned mid-upload, which is what a crash between
+// CreateFile and the final status update leaves behind. Their file_chunks rows cascade away,
+// so the chunks they held become orphaned and are collected by the normal chunk sweep.
+//
+// minAge must comfortably exceed the longest legitimate upload: a row is only stale because
+// nothing has touched it since, and an upload still in flight has not touched it either.
+func (r *repository) DeleteStaleUploads(ctx context.Context, minAge time.Duration) (int64, error) {
+	query := `DELETE FROM files WHERE status = $1 AND updated_at < $2`
+	tag, err := r.db.Exec(ctx, query, StatusUploading, time.Now().Add(-minAge))
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (r *repository) DeleteChunkRecord(ctx context.Context, chunkID string) error {

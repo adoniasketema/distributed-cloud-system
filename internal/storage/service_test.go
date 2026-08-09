@@ -110,6 +110,11 @@ func (m *MockRepository) LockOrphanedChunk(ctx context.Context, chunkID string) 
 	return args.Error(0)
 }
 
+func (m *MockRepository) DeleteStaleUploads(ctx context.Context, minAge time.Duration) (int64, error) {
+	args := m.Called(ctx, minAge)
+	return int64(args.Int(0)), args.Error(1)
+}
+
 func (m *MockRepository) DeleteChunkRecord(ctx context.Context, chunkID string) error {
 	args := m.Called(ctx, chunkID)
 	return args.Error(0)
@@ -179,7 +184,7 @@ func TestStorageService_UploadFile_NewChunks(t *testing.T) {
 	mockStore.On("UploadChunk", mock.Anything, hash2Str, mock.Anything, int64(2*1024*1024)).Return(nil)
 	mockRepo.On("LinkFileChunk", mock.Anything, fileID, "chunk-2", 1).Return(nil)
 
-	mockRepo.On("UpdateFileSizeAndStatus", mock.Anything, fileID, int64(6*1024*1024), "ready").Return(nil)
+	mockRepo.On("UpdateFileSizeAndStatus", mock.Anything, fileID, int64(6*1024*1024), StatusReady).Return(nil)
 
 	id, err := svc.UploadFile(context.Background(), userID, nil, fileName, reader)
 
@@ -219,7 +224,7 @@ func TestStorageService_UploadFile_Deduplication(t *testing.T) {
 	// Notice: UploadChunk is NOT called because of deduplication
 	mockRepo.On("LinkFileChunk", mock.Anything, fileID, "chunk-existing", 0).Return(nil)
 
-	mockRepo.On("UpdateFileSizeAndStatus", mock.Anything, fileID, int64(4*1024*1024), "ready").Return(nil)
+	mockRepo.On("UpdateFileSizeAndStatus", mock.Anything, fileID, int64(4*1024*1024), StatusReady).Return(nil)
 
 	id, err := svc.UploadFile(context.Background(), userID, nil, fileName, reader)
 
@@ -249,6 +254,134 @@ func TestStorageService_UploadFile_RejectsForeignFolder(t *testing.T) {
 	mockRepo.AssertExpectations(t)
 }
 
+func TestStorageService_UploadFile_HoldsNoTransactionAcrossWholeUpload(t *testing.T) {
+	mockRepo := new(MockRepository)
+	mockStore := new(MockObjectStore)
+	svc := NewService(mockRepo, mockStore, nil)
+
+	userID := "user-123"
+	fileID := "file-123"
+
+	// 12MB => 3 chunks. Each chunk must get its own short transaction rather than all
+	// three sharing one that spans the entire transfer.
+	data := make([]byte, 12*1024*1024)
+	var hashes []string
+	for _, size := range []int{4, 4, 4} {
+		sum := sha256.Sum256(make([]byte, size*1024*1024))
+		hashes = append(hashes, hex.EncodeToString(sum[:]))
+	}
+
+	mockTx := new(mockTx)
+	mockTx.On("Commit", mock.Anything).Return(nil)
+	mockTx.On("Rollback", mock.Anything).Return(nil)
+
+	mockRepo.On("BeginTx", mock.Anything).Return(mockTx, nil)
+	mockRepo.On("WithTx", mockTx).Return(mockRepo)
+	mockRepo.On("CreateFile", mock.Anything, userID, (*string)(nil), "big.bin", mock.AnythingOfType("string"), int64(0)).Return(fileID, nil)
+	mockRepo.On("GetOrCreateChunk", mock.Anything, hashes[0], int64(4*1024*1024)).Return("chunk-1", true, nil)
+	mockStore.On("UploadChunk", mock.Anything, hashes[0], mock.Anything, int64(4*1024*1024)).Return(nil)
+	mockRepo.On("LinkFileChunk", mock.Anything, fileID, "chunk-1", mock.AnythingOfType("int")).Return(nil)
+	mockRepo.On("UpdateFileSizeAndStatus", mock.Anything, fileID, int64(12*1024*1024), StatusReady).Return(nil)
+
+	_, err := svc.UploadFile(context.Background(), userID, nil, "big.bin", bytes.NewReader(data))
+	assert.NoError(t, err)
+
+	// One transaction per chunk, not one for the file. This is what bounds how long a
+	// pooled connection is held while bytes move to object storage.
+	mockRepo.AssertNumberOfCalls(t, "BeginTx", 3)
+	mockTx.AssertNumberOfCalls(t, "Commit", 3)
+
+	// The file row is created outside any transaction, so it is durable immediately and
+	// the upload is not holding a connection open for it.
+	mockRepo.AssertNumberOfCalls(t, "CreateFile", 1)
+}
+
+func TestStorageService_UploadFile_CleansUpAfterChunkFailure(t *testing.T) {
+	mockRepo := new(MockRepository)
+	mockStore := new(MockObjectStore)
+	svc := NewService(mockRepo, mockStore, nil)
+
+	userID := "user-123"
+	fileID := "file-123"
+
+	data := make([]byte, 1024)
+	sum := sha256.Sum256(data)
+	hashStr := hex.EncodeToString(sum[:])
+
+	mockTx := new(mockTx)
+	mockTx.On("Rollback", mock.Anything).Return(nil)
+
+	mockRepo.On("BeginTx", mock.Anything).Return(mockTx, nil)
+	mockRepo.On("WithTx", mockTx).Return(mockRepo)
+	mockRepo.On("CreateFile", mock.Anything, userID, (*string)(nil), "f.bin", mock.AnythingOfType("string"), int64(0)).Return(fileID, nil)
+	mockRepo.On("GetOrCreateChunk", mock.Anything, hashStr, int64(1024)).Return("chunk-1", true, nil)
+	mockStore.On("UploadChunk", mock.Anything, hashStr, mock.Anything, int64(1024)).Return(errors.New("minio down"))
+	mockRepo.On("DeleteFile", mock.Anything, userID, fileID).Return(nil)
+
+	id, err := svc.UploadFile(context.Background(), userID, nil, "f.bin", bytes.NewReader(data))
+
+	assert.Error(t, err)
+	assert.Empty(t, id)
+	// Committing the file row up front means failures must be cleaned up explicitly;
+	// there is no rollback to do it any more.
+	mockRepo.AssertCalled(t, "DeleteFile", mock.Anything, userID, fileID)
+	mockRepo.AssertNotCalled(t, "UpdateFileSizeAndStatus", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+func TestStorageService_DownloadFile_RejectsIncompleteUpload(t *testing.T) {
+	mockRepo := new(MockRepository)
+	mockStore := new(MockObjectStore)
+	svc := NewService(mockRepo, mockStore, nil)
+
+	userID := "user-123"
+	fileID := "file-123"
+
+	mockRepo.On("VerifyFileOwnership", mock.Anything, userID, fileID).Return(nil)
+	mockRepo.On("GetFileInfo", mock.Anything, fileID).
+		Return(FileInfo{Name: "half.bin", ContentType: "application/octet-stream", Status: StatusUploading}, nil)
+
+	_, _, err := svc.DownloadFile(context.Background(), userID, fileID)
+
+	// Serving a row that never reached StatusReady would hand back a silently truncated
+	// file, since its chunk list is incomplete.
+	assert.ErrorIs(t, err, ErrFileNotFound)
+	mockRepo.AssertNotCalled(t, "GetFileChunks", mock.Anything, mock.Anything)
+}
+
+func TestStorageService_RunGarbageCollection_SweepsStaleUploads(t *testing.T) {
+	mockRepo := new(MockRepository)
+	mockStore := new(MockObjectStore)
+	svc := NewService(mockRepo, mockStore, nil)
+
+	minAge := 10 * time.Minute
+
+	mockRepo.On("DeleteStaleUploads", mock.Anything, minAge).Return(3, nil)
+	mockRepo.On("GetOrphanedChunks", mock.Anything, minAge).Return([]Chunk{}, nil)
+
+	err := svc.RunGarbageCollection(context.Background(), minAge)
+
+	assert.NoError(t, err)
+	// Uploads are swept before the chunk scan so the chunks they held are eligible.
+	mockRepo.AssertCalled(t, "DeleteStaleUploads", mock.Anything, minAge)
+}
+
+func TestStorageService_RunGarbageCollection_ContinuesWhenUploadSweepFails(t *testing.T) {
+	mockRepo := new(MockRepository)
+	mockStore := new(MockObjectStore)
+	svc := NewService(mockRepo, mockStore, nil)
+
+	minAge := 10 * time.Minute
+
+	mockRepo.On("DeleteStaleUploads", mock.Anything, minAge).Return(0, errors.New("db hiccup"))
+	mockRepo.On("GetOrphanedChunks", mock.Anything, minAge).Return([]Chunk{}, nil)
+
+	err := svc.RunGarbageCollection(context.Background(), minAge)
+
+	// Chunk collection is independent and still worth running.
+	assert.NoError(t, err)
+	mockRepo.AssertCalled(t, "GetOrphanedChunks", mock.Anything, minAge)
+}
+
 func TestStorageService_DownloadFile(t *testing.T) {
 	mockRepo := new(MockRepository)
 	mockStore := new(MockObjectStore)
@@ -261,7 +394,7 @@ func TestStorageService_DownloadFile(t *testing.T) {
 	hashStr := hex.EncodeToString(hashBytes[:])
 
 	mockRepo.On("VerifyFileOwnership", mock.Anything, userID, fileID).Return(nil)
-	mockRepo.On("GetFileInfo", mock.Anything, fileID).Return(FileInfo{Name: "doc.txt", ContentType: "text/plain"}, nil)
+	mockRepo.On("GetFileInfo", mock.Anything, fileID).Return(FileInfo{Name: "doc.txt", ContentType: "text/plain", Status: StatusReady}, nil)
 	mockRepo.On("GetFileChunks", mock.Anything, fileID).Return([]Chunk{
 		{ID: "c1", Hash: hashStr, Size: int64(len(content))},
 	}, nil)
@@ -304,7 +437,7 @@ func TestStorageService_DownloadFile_RejectsCorruptChunkBeforeYieldingData(t *te
 	corrupted := &trackedCloser{Reader: bytes.NewReader([]byte("tampered content"))}
 
 	mockRepo.On("VerifyFileOwnership", mock.Anything, userID, fileID).Return(nil)
-	mockRepo.On("GetFileInfo", mock.Anything, fileID).Return(FileInfo{Name: "doc.txt", ContentType: "text/plain"}, nil)
+	mockRepo.On("GetFileInfo", mock.Anything, fileID).Return(FileInfo{Name: "doc.txt", ContentType: "text/plain", Status: StatusReady}, nil)
 	mockRepo.On("GetFileChunks", mock.Anything, fileID).Return([]Chunk{
 		{ID: "c1", Hash: expectedHash, Size: 16},
 	}, nil)
@@ -330,7 +463,7 @@ func TestStorageService_DownloadFile_DoesNotOpenChunksUntilRead(t *testing.T) {
 	fileID := "file-123"
 
 	mockRepo.On("VerifyFileOwnership", mock.Anything, userID, fileID).Return(nil)
-	mockRepo.On("GetFileInfo", mock.Anything, fileID).Return(FileInfo{Name: "doc.txt", ContentType: "text/plain"}, nil)
+	mockRepo.On("GetFileInfo", mock.Anything, fileID).Return(FileInfo{Name: "doc.txt", ContentType: "text/plain", Status: StatusReady}, nil)
 	mockRepo.On("GetFileChunks", mock.Anything, fileID).Return([]Chunk{
 		{ID: "c1", Hash: "hash-1", Size: 4},
 		{ID: "c2", Hash: "hash-2", Size: 4},
@@ -356,6 +489,7 @@ func TestStorageService_RunGarbageCollection(t *testing.T) {
 	mockTx.On("Commit", mock.Anything).Return(nil)
 	mockTx.On("Rollback", mock.Anything).Return(nil)
 
+	mockRepo.On("DeleteStaleUploads", mock.Anything, minAge).Return(0, nil)
 	mockRepo.On("GetOrphanedChunks", mock.Anything, minAge).Return([]Chunk{orphan}, nil)
 	mockRepo.On("BeginTx", mock.Anything).Return(mockTx, nil)
 	mockRepo.On("WithTx", mockTx).Return(mockRepo)
@@ -382,6 +516,7 @@ func TestStorageService_RunGarbageCollection_SkipsChunkReReferencedSinceScan(t *
 	mockTx := new(mockTx)
 	mockTx.On("Rollback", mock.Anything).Return(nil)
 
+	mockRepo.On("DeleteStaleUploads", mock.Anything, minAge).Return(0, nil)
 	mockRepo.On("GetOrphanedChunks", mock.Anything, minAge).Return([]Chunk{orphan}, nil)
 	mockRepo.On("BeginTx", mock.Anything).Return(mockTx, nil)
 	mockRepo.On("WithTx", mockTx).Return(mockRepo)
@@ -407,6 +542,7 @@ func TestStorageService_RunGarbageCollection_KeepsRecordWhenObjectDeleteFails(t 
 	mockTx := new(mockTx)
 	mockTx.On("Rollback", mock.Anything).Return(nil)
 
+	mockRepo.On("DeleteStaleUploads", mock.Anything, minAge).Return(0, nil)
 	mockRepo.On("GetOrphanedChunks", mock.Anything, minAge).Return([]Chunk{orphan}, nil)
 	mockRepo.On("BeginTx", mock.Anything).Return(mockTx, nil)
 	mockRepo.On("WithTx", mockTx).Return(mockRepo)
