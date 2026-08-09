@@ -68,6 +68,11 @@ func (m *MockRepository) VerifyFileOwnership(ctx context.Context, userID string,
 	return args.Error(0)
 }
 
+func (m *MockRepository) VerifyFolderOwnership(ctx context.Context, userID string, folderID string) error {
+	args := m.Called(ctx, userID, folderID)
+	return args.Error(0)
+}
+
 func (m *MockRepository) UpdateFileSizeAndStatus(ctx context.Context, fileID string, size int64, status string) error {
 	args := m.Called(ctx, fileID, size, status)
 	return args.Error(0)
@@ -217,6 +222,25 @@ func TestStorageService_UploadFile_Deduplication(t *testing.T) {
 	mockRepo.AssertExpectations(t)
 	mockStore.AssertExpectations(t) // Ensure no upload was made to storage
 	mockTx.AssertExpectations(t)
+}
+
+func TestStorageService_UploadFile_RejectsForeignFolder(t *testing.T) {
+	mockRepo := new(MockRepository)
+	mockStore := new(MockObjectStore)
+	svc := NewService(mockRepo, mockStore, nil)
+
+	attacker := "user-attacker"
+	victimFolder := "folder-owned-by-victim"
+
+	mockRepo.On("VerifyFolderOwnership", mock.Anything, attacker, victimFolder).Return(ErrAccessDenied)
+
+	id, err := svc.UploadFile(context.Background(), attacker, &victimFolder, "pwned.txt", bytes.NewReader([]byte("x")))
+
+	assert.ErrorIs(t, err, ErrAccessDenied)
+	assert.Empty(t, id)
+	// No transaction should even be opened for a folder the caller does not own.
+	mockRepo.AssertNotCalled(t, "BeginTx", mock.Anything)
+	mockRepo.AssertExpectations(t)
 }
 
 func TestStorageService_DownloadFile(t *testing.T) {

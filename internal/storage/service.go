@@ -78,6 +78,14 @@ func (i *integrityCheckingReader) Read(p []byte) (int, error) {
 }
 
 func (s *service) UploadFile(ctx context.Context, userID string, folderID *string, name string, fileReader io.Reader) (string, error) {
+	// The folder ID is caller-supplied, so it must be proven to belong to the uploader before
+	// we write a file record into it.
+	if folderID != nil {
+		if err := s.repo.VerifyFolderOwnership(ctx, userID, *folderID); err != nil {
+			return "", err
+		}
+	}
+
 	tx, err := s.repo.BeginTx(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to begin transaction: %w", err)

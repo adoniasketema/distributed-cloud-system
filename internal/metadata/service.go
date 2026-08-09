@@ -25,8 +25,13 @@ func NewService(repo Repository) Service {
 }
 
 func (s *service) CreateFolder(ctx context.Context, userID string, parentID *string, name string) (*Folder, error) {
-	// Future optimization: Verify that the parentID actually belongs to the user
-	// For now, our SQL UNIQUE constraints and user_id checks handle basic isolation.
+	// The parent ID comes straight from the request body, so it must be proven to belong to
+	// the caller. Without this check any user can graft a folder onto another user's tree.
+	if parentID != nil {
+		if err := s.repo.VerifyFolderOwnership(ctx, userID, *parentID); err != nil {
+			return nil, err
+		}
+	}
 	return s.repo.CreateFolder(ctx, userID, parentID, name)
 }
 

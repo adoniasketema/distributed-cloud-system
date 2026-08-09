@@ -42,6 +42,10 @@ func (h *Handler) CreateFolder(w http.ResponseWriter, r *http.Request) {
 
 	folder, err := h.svc.CreateFolder(r.Context(), userID, req.ParentID, req.Name)
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			http.Error(w, "parent folder not found or access denied", http.StatusForbidden)
+			return
+		}
 		if errors.Is(err, ErrDuplicateName) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)

@@ -38,6 +38,7 @@ type Repository interface {
 	GetFileContentType(ctx context.Context, fileID string) (string, error)
 	DeleteFile(ctx context.Context, userID string, fileID string) error
 	VerifyFileOwnership(ctx context.Context, userID string, fileID string) error
+	VerifyFolderOwnership(ctx context.Context, userID string, folderID string) error
 	UpdateFileSizeAndStatus(ctx context.Context, fileID string, size int64, status string) error
 	GetOrCreateChunk(ctx context.Context, hash string, size int64) (string, bool, error)
 	LinkFileChunk(ctx context.Context, fileID, chunkID string, index int) error
@@ -121,6 +122,22 @@ func (r *repository) VerifyFileOwnership(ctx context.Context, userID string, fil
 	err := r.db.QueryRow(ctx, query, fileID, userID).Scan(&exists)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrAccessDenied
+		}
+		return err
+	}
+	return nil
+}
+
+// VerifyFolderOwnership returns ErrAccessDenied unless the folder exists and belongs to userID.
+// A malformed folder ID is reported as ErrAccessDenied rather than a database error.
+func (r *repository) VerifyFolderOwnership(ctx context.Context, userID string, folderID string) error {
+	query := `SELECT 1 FROM folders WHERE id = $1 AND user_id = $2`
+	var exists int
+	err := r.db.QueryRow(ctx, query, folderID, userID).Scan(&exists)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.Is(err, pgx.ErrNoRows) || (errors.As(err, &pgErr) && pgErr.Code == "22P02") {
 			return ErrAccessDenied
 		}
 		return err

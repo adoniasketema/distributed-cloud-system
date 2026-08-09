@@ -48,6 +48,10 @@ func (h *Handler) UploadFile(w http.ResponseWriter, r *http.Request) {
 
 	fileID, err := h.svc.UploadFile(r.Context(), userID, folderID, header.Filename, file)
 	if err != nil {
+		if errors.Is(err, ErrAccessDenied) {
+			http.Error(w, "folder not found or access denied", http.StatusForbidden)
+			return
+		}
 		tracing.Logger(r.Context()).Error("upload file service failed", "error", err, "filename", header.Filename, "user_id", userID)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return

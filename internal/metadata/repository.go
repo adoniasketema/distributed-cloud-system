@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -40,6 +41,7 @@ type Repository interface {
 	CreateFolder(ctx context.Context, userID string, parentID *string, name string) (*Folder, error)
 	ListFolders(ctx context.Context, userID string, parentID *string) ([]Folder, error)
 	DeleteFolder(ctx context.Context, userID string, folderID string) error
+	VerifyFolderOwnership(ctx context.Context, userID string, folderID string) error
 	ListFiles(ctx context.Context, userID string, folderID *string) ([]File, error)
 	SearchFiles(ctx context.Context, userID string, searchQuery string) ([]File, error)
 }
@@ -116,6 +118,29 @@ func (r *repository) DeleteFolder(ctx context.Context, userID string, folderID s
 		return ErrNotFound
 	}
 	return nil
+}
+
+// VerifyFolderOwnership returns ErrNotFound unless the folder exists and belongs to userID.
+// A malformed folder ID is reported as ErrNotFound rather than a database error, so callers
+// cannot distinguish "bad id" from "someone else's folder".
+func (r *repository) VerifyFolderOwnership(ctx context.Context, userID string, folderID string) error {
+	query := `SELECT 1 FROM folders WHERE id = $1 AND user_id = $2`
+	var exists int
+	err := r.db.QueryRow(ctx, query, folderID, userID).Scan(&exists)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) || isInvalidTextRepresentation(err) {
+			return ErrNotFound
+		}
+		return err
+	}
+	return nil
+}
+
+// isInvalidTextRepresentation reports whether err is PostgreSQL's 22P02, which is what
+// the server returns when a non-UUID string is compared against a UUID column.
+func isInvalidTextRepresentation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "22P02"
 }
 
 func (r *repository) ListFiles(ctx context.Context, userID string, folderID *string) ([]File, error) {
