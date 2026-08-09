@@ -2,7 +2,6 @@ package middleware
 
 import (
 	"context"
-	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -18,8 +17,12 @@ type RateLimiter struct {
 	clients map[string]*client
 	limit   int
 	window  time.Duration
+	proxies *TrustedProxies
 }
 
+// NewRateLimiter builds a fixed-window limiter keyed on client address. Callers that sit
+// behind a reverse proxy must pass the proxy CIDRs via SetTrustedProxies, otherwise every
+// request appears to originate from the proxy and all users share a single bucket.
 func NewRateLimiter(ctx context.Context, limit int, window time.Duration) *RateLimiter {
 	rl := &RateLimiter{
 		clients: make(map[string]*client),
@@ -51,12 +54,16 @@ func NewRateLimiter(ctx context.Context, limit int, window time.Duration) *RateL
 	return rl
 }
 
+// SetTrustedProxies configures which peers may have their forwarding headers believed when
+// determining the client address. It is intended to be called at wiring time, before the
+// limiter starts serving.
+func (rl *RateLimiter) SetTrustedProxies(proxies *TrustedProxies) {
+	rl.proxies = proxies
+}
+
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			ip = r.RemoteAddr
-		}
+		ip := rl.proxies.ClientIP(r)
 
 		rl.mu.Lock()
 		now := time.Now()

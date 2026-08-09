@@ -1,6 +1,9 @@
 package config
 
-import "os"
+import (
+	"os"
+	"strings"
+)
 
 // Config holds all application configuration values.
 // Values are loaded from environment variables with sensible defaults for local development.
@@ -24,6 +27,11 @@ type Config struct {
 	// Server
 	APIPort string
 
+	// TrustedProxyCIDRs lists the reverse proxies whose X-Forwarded-For header may be
+	// believed when identifying a client for rate limiting. Empty means trust none and
+	// always use the direct peer address, which is correct for a directly exposed server.
+	TrustedProxyCIDRs []string
+
 	// AI
 	OpenRouterAPIKey string
 }
@@ -41,7 +49,25 @@ func Load() *Config {
 		JWTSecret:        getEnv("JWT_SECRET", "change-me-in-production-use-a-long-random-string"),
 		APIPort:          getEnv("API_PORT", "8080"),
 		OpenRouterAPIKey: getEnv("OPEN_ROUTER_API_KEY", ""),
+
+		TrustedProxyCIDRs: getEnvList("TRUSTED_PROXY_CIDRS"),
 	}
+}
+
+// getEnvList reads a comma-separated environment variable into a slice, dropping empty
+// entries. An unset or blank variable yields nil.
+func getEnvList(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func getEnv(key, fallback string) string {
