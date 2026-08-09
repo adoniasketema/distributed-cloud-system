@@ -57,6 +57,12 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 
 	_, err := h.svc.Register(r.Context(), req.Email, req.Password)
 	if err != nil {
+		// A taken address is an expected outcome of a valid request, not a server fault,
+		// so it gets 409 and does not pollute the error log.
+		if errors.Is(err, ErrEmailTaken) {
+			h.respondError(w, http.StatusConflict, "email already registered")
+			return
+		}
 		tracing.Logger(r.Context()).Error("user registration failed", "error", err, "email", req.Email)
 		h.respondError(w, http.StatusInternalServerError, "failed to register user")
 		return

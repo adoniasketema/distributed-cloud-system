@@ -57,6 +57,22 @@ func TestAuthService_Register(t *testing.T) {
 	mockRepo.AssertExpectations(t)
 }
 
+func TestAuthService_Register_PropagatesEmailTaken(t *testing.T) {
+	mockRepo := new(MockUserRepository)
+	svc := NewService(mockRepo, "test-secret")
+
+	email := "taken@example.com"
+	mockRepo.On("CreateUser", mock.Anything, email, mock.Anything).Return((*User)(nil), ErrEmailTaken)
+
+	user, err := svc.Register(context.Background(), email, "password123")
+
+	// The handler distinguishes this from a server fault to answer 409, so the sentinel
+	// must survive the service layer unwrapped.
+	assert.ErrorIs(t, err, ErrEmailTaken)
+	assert.Nil(t, user)
+	mockRepo.AssertExpectations(t)
+}
+
 func TestAuthService_Login(t *testing.T) {
 	mockRepo := new(MockUserRepository)
 	secret := "test-secret"

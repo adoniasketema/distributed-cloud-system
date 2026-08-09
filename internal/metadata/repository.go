@@ -71,12 +71,22 @@ func (r *repository) CreateFolder(ctx context.Context, userID string, parentID *
 		&folder.UpdatedAt,
 	)
 	if err != nil {
-		if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique constraint") {
+		if isUniqueViolation(err) {
 			return nil, ErrDuplicateName
 		}
 		return nil, err
 	}
 	return &folder, nil
+}
+
+// isUniqueViolation reports whether err is PostgreSQL's 23505.
+//
+// Matching on the SQLSTATE code rather than substrings of the message: the message text is
+// driver- and locale-dependent, so a substring check can both miss real violations and match
+// unrelated errors that happen to contain the word.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 func (r *repository) ListFolders(ctx context.Context, userID string, parentID *string) ([]Folder, error) {
