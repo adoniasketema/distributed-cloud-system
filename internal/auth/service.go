@@ -9,6 +9,30 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// TokenTTL is how long an issued access token stays valid.
+const TokenTTL = 24 * time.Hour
+
+// SigningMethod is the algorithm tokens are issued with. Validators must accept this and
+// nothing else, so that a token cannot be presented under a weaker algorithm.
+var SigningMethod = jwt.SigningMethodHS256
+
+// Claims is the payload of a Nimbus access token.
+//
+// It is a typed struct rather than jwt.MapClaims so the issuer and the validator agree on
+// the shape by construction. With MapClaims every field arrives as interface{} after the
+// JSON round trip and each reader has to type-assert: a claim whose Go type does not survive
+// that round trip (any number becomes float64) silently fails its assertion, and the failure
+// looks like a missing claim rather than a bug.
+type Claims struct {
+	Email string `json:"email"`
+	jwt.RegisteredClaims
+}
+
+// UserID returns the subject, which is the authenticated user's ID.
+func (c *Claims) UserID() string {
+	return c.Subject
+}
+
 // Service defines the interface for our Auth Service
 type Service interface {
 	Register(ctx context.Context, email, password string) (*User, error)
@@ -66,12 +90,17 @@ func (s *authService) Login(ctx context.Context, email, password string) (string
 	}
 
 	// 3. Generate JWT
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"sub": user.ID,
-		"email": user.Email,
-		"exp": time.Now().Add(time.Hour * 24).Unix(), // Expires in 24 hours
-		"iat": time.Now().Unix(),
-	})
+	now := time.Now()
+	claims := Claims{
+		Email: user.Email,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   user.ID,
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(TokenTTL)),
+		},
+	}
+
+	token := jwt.NewWithClaims(SigningMethod, claims)
 
 	tokenString, err := token.SignedString([]byte(s.jwtSecret))
 	if err != nil {
