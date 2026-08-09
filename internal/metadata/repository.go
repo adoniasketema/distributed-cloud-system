@@ -172,19 +172,32 @@ func (r *repository) ListFiles(ctx context.Context, userID string, folderID *str
 	return files, nil
 }
 
+// MaxSearchResults bounds a single search response. Search has no pagination, so without a
+// cap a common substring returns every file the user owns in one unbounded result set.
+const MaxSearchResults = 200
+
+// likePatternEscaper neutralises ILIKE wildcards in user input so a search for "%" matches
+// a literal percent sign instead of every row. Backslash is PostgreSQL's default LIKE
+// escape character, so it has to be escaped first for the other rules to hold.
+var likePatternEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
 func (r *repository) SearchFiles(ctx context.Context, userID string, searchQuery string) ([]File, error) {
-	// Optimize search utilizing GIN index on embeddings and targeted JSONB extraction
+	// Optimize search utilizing GIN index on embeddings and targeted JSONB extraction.
+	// $2 is the raw term, used for exact JSONB tag containment. $3 is the same term with
+	// ILIKE metacharacters escaped, used for every substring match.
 	query := `
-		SELECT f.id, f.user_id, f.folder_id, f.name, f.content_type, f.size, f.status, f.created_at, f.updated_at 
+		SELECT f.id, f.user_id, f.folder_id, f.name, f.content_type, f.size, f.status, f.created_at, f.updated_at
 		FROM files f
 		LEFT JOIN file_embeddings fe ON f.id = fe.file_id
-		WHERE f.user_id = $1 
-		  AND (f.name ILIKE '%' || $2 || '%' 
+		WHERE f.user_id = $1
+		  AND (f.name ILIKE '%' || $3 || '%'
 		       OR fe.embedding @> json_build_object('tags', json_build_array($2))::jsonb
-		       OR fe.embedding->>'summary' ILIKE '%' || $2 || '%'
-		       OR (fe.embedding->'tags')::text ILIKE '%' || $2 || '%')
+		       OR fe.embedding->>'summary' ILIKE '%' || $3 || '%'
+		       OR (fe.embedding->'tags')::text ILIKE '%' || $3 || '%')
+		ORDER BY f.created_at DESC, f.id
+		LIMIT $4
 	`
-	rows, err := r.db.Query(ctx, query, userID, searchQuery)
+	rows, err := r.db.Query(ctx, query, userID, searchQuery, likePatternEscaper.Replace(searchQuery), MaxSearchResults)
 	if err != nil {
 		return nil, err
 	}

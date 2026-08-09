@@ -119,6 +119,29 @@ func TestMetadataService_CreateFolder_RejectsForeignParent(t *testing.T) {
 	mockRepo.AssertExpectations(t)
 }
 
+func TestLikePatternEscaper(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"plain text is untouched", "report", "report"},
+		{"percent becomes literal", "%", `\%`},
+		{"underscore becomes literal", "_", `\_`},
+		{"backslash is escaped", `a\b`, `a\\b`},
+		{"match-everything pattern is defused", "%_%", `\%\_\%`},
+		// Escaping backslash first matters: a naive replacer would turn `\` into `\\`
+		// after already producing `\%`, re-enabling the wildcard.
+		{"backslash before percent", `\%`, `\\\%`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, likePatternEscaper.Replace(tc.input))
+		})
+	}
+}
+
 func TestMetadataService_ListDirectory(t *testing.T) {
 	mockRepo := new(MockMetadataRepository)
 	svc := NewService(mockRepo)
