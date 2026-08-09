@@ -42,7 +42,7 @@ func New(dsn string, maxConns int32) (*pgxpool.Pool, error) {
 	// Ping to ensure connection is valid
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	
+
 	if err := pool.Ping(ctx); err != nil {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}

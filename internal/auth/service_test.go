@@ -41,7 +41,7 @@ func TestAuthService_Register(t *testing.T) {
 	email := "test@example.com"
 	password := "password123"
 
-	// We expect CreateUser to be called. We use mock.Anything for the passwordHash 
+	// We expect CreateUser to be called. We use mock.Anything for the passwordHash
 	// because it's randomly salted bcrypt.
 	mockRepo.On("CreateUser", mock.Anything, email, mock.Anything).Return(&User{
 		ID:    "123",
@@ -80,7 +80,7 @@ func TestAuthService_Login(t *testing.T) {
 
 	email := "test@example.com"
 	password := "password123"
-	
+
 	// Create a valid bcrypt hash for the test password
 	hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
 
@@ -124,7 +124,7 @@ func TestAuthService_Login_InvalidCredentials(t *testing.T) {
 	svc := NewService(mockRepo, "test-secret")
 
 	email := "test@example.com"
-	
+
 	// Return user not found
 	mockRepo.On("GetUserByEmail", mock.Anything, email).Return((*User)(nil), errors.New("user not found"))
 

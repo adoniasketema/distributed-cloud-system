@@ -38,25 +38,30 @@ type Config struct {
 
 	// AI
 	OpenRouterAPIKey string
+	// OpenRouterModel is the model id used for file enrichment. No default: ids are
+	// account-dependent and OpenRouter retires them, so a stale constant would fail on
+	// every upload with nothing in the code to explain why.
+	OpenRouterModel string
 }
 
 // Load reads configuration from environment variables, falling back to local dev defaults.
 func Load() *Config {
 	return &Config{
-		DatabaseURL:      getEnv("DATABASE_URL", "postgres://nimbus:password@localhost:5432/nimbus_db?sslmode=disable"),
-		DBMaxConns:       int32(getEnvInt("DB_MAX_CONNS", 0)),
-		MinIOEndpoint:    getEnv("MINIO_ENDPOINT", "localhost:9000"),
-		MinIOAccessKey:   getEnv("MINIO_ACCESS_KEY", "minioadmin"),
-		MinIOSecretKey:   getEnv("MINIO_SECRET_KEY", "minioadmin"),
-		MinIOUseSSL:      getEnv("MINIO_USE_SSL", "false") == "true",
-		RedisAddr:        getEnv("REDIS_ADDR", "localhost:6379"),
-		RedisPassword:    getEnv("REDIS_PASSWORD", ""),
+		DatabaseURL:    getEnv("DATABASE_URL", "postgres://nimbus:password@localhost:5432/nimbus_db?sslmode=disable"),
+		DBMaxConns:     int32(getEnvInt("DB_MAX_CONNS", 0)),
+		MinIOEndpoint:  getEnv("MINIO_ENDPOINT", "localhost:9000"),
+		MinIOAccessKey: getEnv("MINIO_ACCESS_KEY", "minioadmin"),
+		MinIOSecretKey: getEnv("MINIO_SECRET_KEY", "minioadmin"),
+		MinIOUseSSL:    getEnv("MINIO_USE_SSL", "false") == "true",
+		RedisAddr:      getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisPassword:  getEnv("REDIS_PASSWORD", ""),
 		// Deliberately no fallback. A default signing key that ships in the repository is
 		// a published secret: anyone who reads it can forge a token for any user, and the
 		// service would start silently rather than telling you.
 		JWTSecret:        os.Getenv("JWT_SECRET"),
 		APIPort:          getEnv("API_PORT", "8080"),
 		OpenRouterAPIKey: getEnv("OPEN_ROUTER_API_KEY", ""),
+		OpenRouterModel:  getEnv("OPENROUTER_MODEL", ""),
 
 		TrustedProxyCIDRs: getEnvList("TRUSTED_PROXY_CIDRS"),
 	}

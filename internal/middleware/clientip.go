@@ -103,4 +103,3 @@ func peerIP(remoteAddr string) string {
 	}
 	return host
 }
-

@@ -41,6 +41,7 @@ func TestGenerateAndSaveEmbedding_Success(t *testing.T) {
 	svc := &service{
 		repo:   mockRepo,
 		apiKey: "test-key-123",
+		model:  "test/model",
 		apiURL: ts.URL,
 	}
 
@@ -51,9 +52,21 @@ func TestGenerateAndSaveEmbedding_Success(t *testing.T) {
 
 func TestGenerateAndSaveEmbedding_NoAPIKey(t *testing.T) {
 	mockRepo := new(MockRepository)
-	svc := NewService(mockRepo, "")
+	svc := NewService(mockRepo, "", "test/model")
 
 	err := svc.GenerateAndSaveEmbedding(context.Background(), "file-100", "Sample content")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "OpenRouter API key is not configured")
+}
+
+func TestGenerateAndSaveEmbedding_NoModel(t *testing.T) {
+	mockRepo := new(MockRepository)
+	svc := NewService(mockRepo, "test-key-123", "")
+
+	err := svc.GenerateAndSaveEmbedding(context.Background(), "file-100", "Sample content")
+
+	// Failing here, with the setting named, beats sending a request with an empty model
+	// and surfacing whatever OpenRouter says about it.
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "OPENROUTER_MODEL")
 }

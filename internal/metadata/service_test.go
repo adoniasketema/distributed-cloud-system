@@ -62,7 +62,7 @@ func TestMetadataService_CreateFolder(t *testing.T) {
 
 	userID := "user-123"
 	folderName := "Documents"
-	
+
 	expectedFolder := &Folder{
 		ID:        "folder-123",
 		UserID:    userID,

@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same branch rather than paying for both.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Track the toolchain declared in go.mod so CI cannot drift from local builds.
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            echo "Run: gofmt -w ."
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # -race is the point of running tests in CI for this project: the upload path, the
+      # garbage collector and the rate limiter all coordinate across goroutines, and those
+      # are exactly the bugs that do not reproduce on a developer's machine.
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      # Builds each binary by explicit path. This is what catches a source directory that is
+      # missing from the repository: `go build ./...` happily succeeds on a tree where an
+      # entire cmd/ package was never committed, because there is nothing there to compile.
+      # A .gitignore pattern once excluded cmd/api this way and the API went untracked.
+      - name: Build binaries
+        run: make build
+
+  verify-committed:
+    name: Verify no source is excluded from the repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A .gitignore pattern that matches a source path removes it from the repo silently:
+      # everything keeps working locally, where the file is still on disk, and only a fresh
+      # clone reveals it. Fail loudly instead.
+      - name: Check .gitignore does not exclude tracked source
+        run: |
+          ignored="$(git ls-files --cached --ignored --exclude-standard)"
+          if [ -n "$ignored" ]; then
+            echo "These tracked files match a .gitignore rule:"
+            echo "$ignored"
+            exit 1
+          fi
+
+      - name: Check every Go source file on disk is tracked
+        run: |
+          untracked="$(git ls-files --others --exclude-standard -- '*.go')"
+          if [ -n "$untracked" ]; then
+            echo "These Go files exist but are not tracked by git:"
+            echo "$untracked"
+            echo "They will be missing from a fresh clone. Commit them, or narrow the"
+            echo ".gitignore rule that is hiding them."
+            exit 1
+          fi
+
+  vulncheck:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...

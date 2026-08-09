@@ -56,7 +56,7 @@ func main() {
 	storageSvc := storage.NewService(storageRepo, minioClient, nil)
 
 	aiRepo := ai.NewRepository(dbPool)
-	aiSvc := ai.NewService(aiRepo, cfg.OpenRouterAPIKey)
+	aiSvc := ai.NewService(aiRepo, cfg.OpenRouterAPIKey, cfg.OpenRouterModel)
 
 	// 3. Initialize Processor
 	processor := worker.NewProcessor(storageSvc, aiSvc)
