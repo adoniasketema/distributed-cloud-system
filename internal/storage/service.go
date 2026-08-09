@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
-	"nimbus/internal/events"
 	"time"
+
+	"nimbus/internal/events"
+	"nimbus/internal/tracing"
 )
 
 const ChunkSize = 4 * 1024 * 1024 // 4MB
@@ -247,22 +249,70 @@ func (s *service) DownloadFileInternal(ctx context.Context, fileID string) (io.R
 }
 
 func (s *service) RunGarbageCollection(ctx context.Context, minAge time.Duration) error {
+	logger := tracing.Logger(ctx)
+
 	orphaned, err := s.repo.GetOrphanedChunks(ctx, minAge)
 	if err != nil {
 		return fmt.Errorf("failed to query orphaned chunks: %w", err)
 	}
-	if len(orphaned) > 0 {
-		log.Printf("Garbage collection identified %d unreferenced chunks for cleanup", len(orphaned))
+	if len(orphaned) == 0 {
+		return nil
 	}
+	logger.Info("garbage collection identified unreferenced chunks", "count", len(orphaned))
+
+	var collected, skipped int
 	for _, chunk := range orphaned {
-		log.Printf("GC: Deleting orphaned chunk %s (hash: %s) from storage", chunk.ID, chunk.Hash)
-		if err := s.store.DeleteChunk(ctx, chunk.Hash); err != nil {
-			log.Printf("GC: Failed to delete chunk from storage: %v", err)
-			continue
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		if err := s.repo.DeleteChunkRecord(ctx, chunk.ID); err != nil {
-			log.Printf("GC: Failed to delete chunk database record: %v", err)
+		switch err := s.collectChunk(ctx, chunk); {
+		case err == nil:
+			collected++
+		case errors.Is(err, ErrChunkInUse):
+			// Referenced by an upload that landed after the scan; correct to leave it.
+			skipped++
+		default:
+			logger.Error("failed to collect orphaned chunk", "error", err, "chunk_id", chunk.ID, "hash", chunk.Hash)
 		}
+	}
+
+	logger.Info("garbage collection finished", "collected", collected, "skipped", skipped, "candidates", len(orphaned))
+	return nil
+}
+
+// collectChunk removes one orphaned chunk and its backing object.
+//
+// The row is locked and re-checked for references inside a transaction, and the object is
+// deleted *before* that transaction commits. Holding the lock across the object delete is
+// what makes this safe against a concurrent upload of identical content: such an upload
+// blocks on the row (see GetOrCreateChunk), and by the time it proceeds the row is gone, so
+// it re-inserts and re-uploads rather than adopting a chunk whose object we just removed.
+//
+// Deleting the object first also means a crash mid-collection leaves a row pointing at a
+// missing object only if the commit succeeds, which it cannot once we have rolled back.
+func (s *service) collectChunk(ctx context.Context, chunk Chunk) error {
+	tx, err := s.repo.BeginTx(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin gc transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	txRepo := s.repo.WithTx(tx)
+
+	if err := txRepo.LockOrphanedChunk(ctx, chunk.ID); err != nil {
+		return err
+	}
+
+	if err := s.store.DeleteChunk(ctx, chunk.Hash); err != nil {
+		return fmt.Errorf("failed to delete chunk object from storage: %w", err)
+	}
+
+	if err := txRepo.DeleteChunkRecord(ctx, chunk.ID); err != nil {
+		return fmt.Errorf("failed to delete chunk record: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit chunk collection: %w", err)
 	}
 	return nil
 }

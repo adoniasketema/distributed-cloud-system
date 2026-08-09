@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -102,6 +103,11 @@ func (m *MockRepository) GetOrphanedChunks(ctx context.Context, minAge time.Dura
 		return chunks.([]Chunk), args.Error(1)
 	}
 	return nil, args.Error(1)
+}
+
+func (m *MockRepository) LockOrphanedChunk(ctx context.Context, chunkID string) error {
+	args := m.Called(ctx, chunkID)
+	return args.Error(0)
 }
 
 func (m *MockRepository) DeleteChunkRecord(ctx context.Context, chunkID string) error {
@@ -345,7 +351,14 @@ func TestStorageService_RunGarbageCollection(t *testing.T) {
 	orphan := Chunk{ID: "chunk-999", Hash: "deadbeefhash", Size: 4096}
 	minAge := 10 * time.Minute
 
+	mockTx := new(mockTx)
+	mockTx.On("Commit", mock.Anything).Return(nil)
+	mockTx.On("Rollback", mock.Anything).Return(nil)
+
 	mockRepo.On("GetOrphanedChunks", mock.Anything, minAge).Return([]Chunk{orphan}, nil)
+	mockRepo.On("BeginTx", mock.Anything).Return(mockTx, nil)
+	mockRepo.On("WithTx", mockTx).Return(mockRepo)
+	mockRepo.On("LockOrphanedChunk", mock.Anything, "chunk-999").Return(nil)
 	mockStore.On("DeleteChunk", mock.Anything, "deadbeefhash").Return(nil)
 	mockRepo.On("DeleteChunkRecord", mock.Anything, "chunk-999").Return(nil)
 
@@ -353,4 +366,58 @@ func TestStorageService_RunGarbageCollection(t *testing.T) {
 	assert.NoError(t, err)
 	mockRepo.AssertExpectations(t)
 	mockStore.AssertExpectations(t)
+	mockTx.AssertExpectations(t)
+}
+
+func TestStorageService_RunGarbageCollection_SkipsChunkReReferencedSinceScan(t *testing.T) {
+	mockRepo := new(MockRepository)
+	mockStore := new(MockObjectStore)
+	svc := NewService(mockRepo, mockStore, nil)
+
+	// Listed as orphaned by the scan, but an upload linked it before we got the lock.
+	orphan := Chunk{ID: "chunk-999", Hash: "deadbeefhash", Size: 4096}
+	minAge := 10 * time.Minute
+
+	mockTx := new(mockTx)
+	mockTx.On("Rollback", mock.Anything).Return(nil)
+
+	mockRepo.On("GetOrphanedChunks", mock.Anything, minAge).Return([]Chunk{orphan}, nil)
+	mockRepo.On("BeginTx", mock.Anything).Return(mockTx, nil)
+	mockRepo.On("WithTx", mockTx).Return(mockRepo)
+	mockRepo.On("LockOrphanedChunk", mock.Anything, "chunk-999").Return(ErrChunkInUse)
+
+	err := svc.RunGarbageCollection(context.Background(), minAge)
+	assert.NoError(t, err)
+
+	// The whole point: a chunk that regained a reference keeps its object and its row.
+	mockStore.AssertNotCalled(t, "DeleteChunk", mock.Anything, mock.Anything)
+	mockRepo.AssertNotCalled(t, "DeleteChunkRecord", mock.Anything, mock.Anything)
+	mockTx.AssertNotCalled(t, "Commit", mock.Anything)
+}
+
+func TestStorageService_RunGarbageCollection_KeepsRecordWhenObjectDeleteFails(t *testing.T) {
+	mockRepo := new(MockRepository)
+	mockStore := new(MockObjectStore)
+	svc := NewService(mockRepo, mockStore, nil)
+
+	orphan := Chunk{ID: "chunk-999", Hash: "deadbeefhash", Size: 4096}
+	minAge := 10 * time.Minute
+
+	mockTx := new(mockTx)
+	mockTx.On("Rollback", mock.Anything).Return(nil)
+
+	mockRepo.On("GetOrphanedChunks", mock.Anything, minAge).Return([]Chunk{orphan}, nil)
+	mockRepo.On("BeginTx", mock.Anything).Return(mockTx, nil)
+	mockRepo.On("WithTx", mockTx).Return(mockRepo)
+	mockRepo.On("LockOrphanedChunk", mock.Anything, "chunk-999").Return(nil)
+	mockStore.On("DeleteChunk", mock.Anything, "deadbeefhash").Return(errors.New("minio unavailable"))
+
+	err := svc.RunGarbageCollection(context.Background(), minAge)
+	// One bad chunk must not abort the sweep.
+	assert.NoError(t, err)
+
+	// The row must survive so the chunk is retried next sweep rather than being
+	// silently dropped while its object is still present.
+	mockRepo.AssertNotCalled(t, "DeleteChunkRecord", mock.Anything, mock.Anything)
+	mockTx.AssertNotCalled(t, "Commit", mock.Anything)
 }

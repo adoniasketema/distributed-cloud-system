@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,6 +14,9 @@ import (
 var (
 	ErrFileNotFound = errors.New("file not found")
 	ErrAccessDenied = errors.New("file not found or access denied")
+	// ErrChunkInUse means a chunk gained a reference since it was listed as orphaned,
+	// so the garbage collector must leave it alone.
+	ErrChunkInUse = errors.New("chunk is no longer orphaned")
 )
 
 type Chunk struct {
@@ -46,6 +50,7 @@ type Repository interface {
 
 	// Garbage collection support
 	GetOrphanedChunks(ctx context.Context, minAge time.Duration) ([]Chunk, error)
+	LockOrphanedChunk(ctx context.Context, chunkID string) error
 	DeleteChunkRecord(ctx context.Context, chunkID string) error
 }
 
@@ -148,27 +153,69 @@ func (r *repository) VerifyFolderOwnership(ctx context.Context, userID string, f
 // GetOrCreateChunk atomically inserts a chunk or returns the existing one.
 // It returns (chunkID, isNew, error), eliminating the TOCTOU race condition in deduplication.
 func (r *repository) GetOrCreateChunk(ctx context.Context, hash string, size int64) (string, bool, error) {
-	insertQuery := `
+	const insertQuery = `
 		INSERT INTO chunks (hash, size)
 		VALUES ($1, $2)
 		ON CONFLICT (hash) DO NOTHING
 		RETURNING id
 	`
-	var chunkID string
-	err := r.db.QueryRow(ctx, insertQuery, hash, size).Scan(&chunkID)
-	if err == nil {
-		return chunkID, true, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", false, err
-	}
+	// FOR SHARE, not a plain SELECT. If the garbage collector is mid-flight for this hash it
+	// holds FOR UPDATE on the row while it deletes the backing object, so we must wait it
+	// out: a plain SELECT would hand back the doomed row, we would treat the chunk as already
+	// stored, skip the upload, and leave this file pointing at an object about to vanish.
+	// Once GC commits, the row is gone and we fall through to a re-insert that re-uploads.
+	//
+	// A shared lock (rather than FOR UPDATE) lets concurrent uploads referencing the same
+	// chunks in different orders proceed without deadlocking each other, while still being
+	// enough to block GC.
+	const selectQuery = `SELECT id FROM chunks WHERE hash = $1 FOR SHARE`
 
-	selectQuery := `SELECT id FROM chunks WHERE hash = $1`
-	err = r.db.QueryRow(ctx, selectQuery, hash).Scan(&chunkID)
-	if err != nil {
-		return "", false, err
+	// Insert and select can each lose a race with a concurrent writer; retrying converges.
+	for attempt := 0; attempt < 3; attempt++ {
+		var chunkID string
+		err := r.db.QueryRow(ctx, insertQuery, hash, size).Scan(&chunkID)
+		if err == nil {
+			return chunkID, true, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return "", false, err
+		}
+
+		err = r.db.QueryRow(ctx, selectQuery, hash).Scan(&chunkID)
+		if err == nil {
+			return chunkID, false, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return "", false, err
+		}
+		// The row was collected between our insert and our select. Retry the insert.
 	}
-	return chunkID, false, nil
+	return "", false, fmt.Errorf("chunk %s: could not resolve after repeated races with concurrent writers", hash)
+}
+
+// LockOrphanedChunk takes an exclusive row lock on a chunk, but only while it is still
+// unreferenced. It returns ErrChunkInUse if the chunk gained a reference (or was already
+// collected) since it was listed, which makes it safe to call on a stale scan result.
+//
+// The lock is held until the caller's transaction ends, which is what lets the garbage
+// collector delete the backing object and the row as one unit with respect to uploads.
+func (r *repository) LockOrphanedChunk(ctx context.Context, chunkID string) error {
+	query := `
+		SELECT 1
+		FROM chunks c
+		WHERE c.id = $1
+		  AND NOT EXISTS (SELECT 1 FROM file_chunks fc WHERE fc.chunk_id = c.id)
+		FOR UPDATE
+	`
+	var exists int
+	err := r.db.QueryRow(ctx, query, chunkID).Scan(&exists)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrChunkInUse
+		}
+		return err
+	}
+	return nil
 }
 
 func (r *repository) LinkFileChunk(ctx context.Context, fileID, chunkID string, index int) error {
