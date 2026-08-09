@@ -95,10 +95,17 @@ func main() {
 		slog.Info("trusting proxy headers from configured networks", "cidrs", cfg.TrustedProxyCIDRs)
 	}
 
+	// Counters live in Redis so the limit is enforced across every replica. A per-process
+	// limiter would multiply the quota by the number of instances and let a client evade it
+	// by spreading requests across them. Each tier gets its own namespace so their counters
+	// never mix.
 	generalRL := middleware.NewRateLimiter(appCtx, 60, time.Minute)
 	generalRL.SetTrustedProxies(trustedProxies)
+	generalRL.SetSharedStore(middleware.NewRedisCounterStore(redisBroker.Client(), "general"))
+
 	strictRL := middleware.NewRateLimiter(appCtx, 15, time.Minute)
 	strictRL.SetTrustedProxies(trustedProxies)
+	strictRL.SetSharedStore(middleware.NewRedisCounterStore(redisBroker.Client(), "strict"))
 
 	generalLimiter := generalRL.Middleware
 	strictLimiter := strictRL.Middleware

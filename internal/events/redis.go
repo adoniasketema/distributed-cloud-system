@@ -68,6 +68,12 @@ func (r *redisBroker) Ping(ctx context.Context) error {
 	return r.client.Ping(ctx).Err()
 }
 
+// Client exposes the underlying connection so other components that need Redis - the
+// cross-replica rate limiter, for one - can reuse this pool rather than opening their own.
+func (r *redisBroker) Client() *redis.Client {
+	return r.client
+}
+
 func (r *redisBroker) PublishFileUploaded(ctx context.Context, fileID string) error {
 	return r.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: StreamName,
