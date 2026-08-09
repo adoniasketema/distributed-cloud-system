@@ -35,11 +35,14 @@ func (s *service) CreateFolder(ctx context.Context, userID string, parentID *str
 	return s.repo.CreateFolder(ctx, userID, parentID, name)
 }
 
+// DeleteFolder removes a folder and everything beneath it.
+//
+// The recursion is done by PostgreSQL, not here: folders.parent_id, files.folder_id and
+// file_chunks.file_id all declare ON DELETE CASCADE (migrations 00002 and 00003), so one
+// DELETE removes the whole subtree. Chunk rows survive - file_chunks.chunk_id is RESTRICT
+// and chunks are shared between files - and are reclaimed later by the storage garbage
+// collector once nothing references them.
 func (s *service) DeleteFolder(ctx context.Context, userID string, folderID string) error {
-	// Recursive deletion of files/folders is handled by PostgreSQL ON DELETE CASCADE 
-	// assuming parent_id has ON DELETE CASCADE.
-	// Wait, let's verify if parent_id has CASCADE... if not, it will fail with RESTRICT.
-	// For Chunk 6, this basic deletion assumes empty folders or cascading setup.
 	return s.repo.DeleteFolder(ctx, userID, folderID)
 }
 

@@ -224,6 +224,16 @@ func (s *service) DownloadFile(ctx context.Context, userID string, fileID string
 	return io.MultiReader(readers...), info, nil
 }
 
+// DeleteFile removes the file record; its chunks are reclaimed later, not here.
+//
+// Chunks are content-addressed and shared across files, so deleting a file cannot delete its
+// chunks - another file may reference the identical content. Establishing that nothing else
+// references a chunk is only sound under a lock, which is what RunGarbageCollection does.
+//
+// So space is reclaimed eventually rather than immediately: the worker sweeps every 6 hours
+// and only collects chunks unreferenced for at least 24 hours (see cmd/worker). That age
+// floor is deliberate - it keeps the collector away from in-flight uploads, whose chunk rows
+// exist before the file rows that come to reference them.
 func (s *service) DeleteFile(ctx context.Context, userID string, fileID string) error {
 	err := s.repo.DeleteFile(ctx, userID, fileID)
 	if err != nil {
