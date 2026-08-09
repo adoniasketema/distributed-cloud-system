@@ -25,6 +25,12 @@ type Chunk struct {
 	Size int64
 }
 
+// FileInfo carries the response metadata for a download.
+type FileInfo struct {
+	Name        string
+	ContentType string
+}
+
 // DBTX is an interface that both *pgxpool.Pool and pgx.Tx satisfy, allowing the same
 // repository methods to work with or without transactions.
 type DBTX interface {
@@ -39,7 +45,7 @@ type Repository interface {
 	WithTx(tx pgx.Tx) Repository
 
 	CreateFile(ctx context.Context, userID string, folderID *string, name string, contentType string, size int64) (string, error)
-	GetFileContentType(ctx context.Context, fileID string) (string, error)
+	GetFileInfo(ctx context.Context, fileID string) (FileInfo, error)
 	DeleteFile(ctx context.Context, userID string, fileID string) error
 	VerifyFileOwnership(ctx context.Context, userID string, fileID string) error
 	VerifyFolderOwnership(ctx context.Context, userID string, folderID string) error
@@ -86,17 +92,17 @@ func (r *repository) CreateFile(ctx context.Context, userID string, folderID *st
 	return fileID, nil
 }
 
-func (r *repository) GetFileContentType(ctx context.Context, fileID string) (string, error) {
-	query := `SELECT content_type FROM files WHERE id = $1`
-	var contentType string
-	err := r.db.QueryRow(ctx, query, fileID).Scan(&contentType)
+func (r *repository) GetFileInfo(ctx context.Context, fileID string) (FileInfo, error) {
+	query := `SELECT name, content_type FROM files WHERE id = $1`
+	var info FileInfo
+	err := r.db.QueryRow(ctx, query, fileID).Scan(&info.Name, &info.ContentType)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return "", ErrFileNotFound
+			return FileInfo{}, ErrFileNotFound
 		}
-		return "", err
+		return FileInfo{}, err
 	}
-	return contentType, nil
+	return info, nil
 }
 
 func (r *repository) UpdateFileSizeAndStatus(ctx context.Context, fileID string, size int64, status string) error {

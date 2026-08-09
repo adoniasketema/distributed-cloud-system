@@ -27,7 +27,7 @@ func (p *Processor) ProcessFileUploaded(ctx context.Context, fileID string) erro
 	logger.Info("worker began processing file uploaded event")
 
 	// 1. Download the file from storage (internal access — no ownership check needed for system workers)
-	reader, err := p.storageSvc.DownloadFileInternal(ctx, fileID)
+	reader, _, err := p.storageSvc.DownloadFileInternal(ctx, fileID)
 	if err != nil {
 		return fmt.Errorf("failed to download file: %w", err)
 	}

@@ -19,8 +19,8 @@ const ChunkSize = 4 * 1024 * 1024 // 4MB
 
 type Service interface {
 	UploadFile(ctx context.Context, userID string, folderID *string, name string, fileReader io.Reader) (string, error)
-	DownloadFile(ctx context.Context, userID string, fileID string) (io.Reader, string, error)
-	DownloadFileInternal(ctx context.Context, fileID string) (io.Reader, error)
+	DownloadFile(ctx context.Context, userID string, fileID string) (io.Reader, FileInfo, error)
+	DownloadFileInternal(ctx context.Context, fileID string) (io.Reader, FileInfo, error)
 	DeleteFile(ctx context.Context, userID string, fileID string) error
 	RunGarbageCollection(ctx context.Context, minAge time.Duration) error
 }
@@ -197,20 +197,20 @@ func (s *service) UploadFile(ctx context.Context, userID string, folderID *strin
 	return fileID, nil
 }
 
-func (s *service) DownloadFile(ctx context.Context, userID string, fileID string) (io.Reader, string, error) {
+func (s *service) DownloadFile(ctx context.Context, userID string, fileID string) (io.Reader, FileInfo, error) {
 	// Verify the requesting user owns this file
 	if err := s.repo.VerifyFileOwnership(ctx, userID, fileID); err != nil {
-		return nil, "", fmt.Errorf("access denied: %w", err)
+		return nil, FileInfo{}, fmt.Errorf("access denied: %w", err)
 	}
 
-	contentType, err := s.repo.GetFileContentType(ctx, fileID)
+	info, err := s.repo.GetFileInfo(ctx, fileID)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to retrieve content type: %w", err)
+		return nil, FileInfo{}, fmt.Errorf("failed to retrieve file info: %w", err)
 	}
 
 	chunks, err := s.repo.GetFileChunks(ctx, fileID)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to get file chunks: %w", err)
+		return nil, FileInfo{}, fmt.Errorf("failed to get file chunks: %w", err)
 	}
 
 	// Readers are lazy: each chunk is fetched and integrity-checked only when the client
@@ -221,7 +221,7 @@ func (s *service) DownloadFile(ctx context.Context, userID string, fileID string
 	}
 
 	// Combine all chunk streams sequentially
-	return io.MultiReader(readers...), contentType, nil
+	return io.MultiReader(readers...), info, nil
 }
 
 func (s *service) DeleteFile(ctx context.Context, userID string, fileID string) error {
@@ -233,11 +233,17 @@ func (s *service) DeleteFile(ctx context.Context, userID string, fileID string) 
 }
 
 // DownloadFileInternal is for system-level access (e.g., background workers).
-// It skips ownership verification and content type retrieval since the worker only needs the raw bytes.
-func (s *service) DownloadFileInternal(ctx context.Context, fileID string) (io.Reader, error) {
+// It skips ownership verification since workers act on behalf of the system, but still
+// returns the file's metadata so callers can decide whether the content is worth reading.
+func (s *service) DownloadFileInternal(ctx context.Context, fileID string) (io.Reader, FileInfo, error) {
+	info, err := s.repo.GetFileInfo(ctx, fileID)
+	if err != nil {
+		return nil, FileInfo{}, fmt.Errorf("failed to retrieve file info: %w", err)
+	}
+
 	chunks, err := s.repo.GetFileChunks(ctx, fileID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get file chunks: %w", err)
+		return nil, FileInfo{}, fmt.Errorf("failed to get file chunks: %w", err)
 	}
 
 	readers := make([]io.Reader, 0, len(chunks))
@@ -245,7 +251,7 @@ func (s *service) DownloadFileInternal(ctx context.Context, fileID string) (io.R
 		readers = append(readers, newVerifiedChunkReader(ctx, s.store, chunk.Hash))
 	}
 
-	return io.MultiReader(readers...), nil
+	return io.MultiReader(readers...), info, nil
 }
 
 func (s *service) RunGarbageCollection(ctx context.Context, minAge time.Duration) error {

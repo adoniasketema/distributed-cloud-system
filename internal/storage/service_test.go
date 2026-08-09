@@ -54,9 +54,9 @@ func (m *MockRepository) CreateFile(ctx context.Context, userID string, folderID
 	return args.String(0), args.Error(1)
 }
 
-func (m *MockRepository) GetFileContentType(ctx context.Context, fileID string) (string, error) {
+func (m *MockRepository) GetFileInfo(ctx context.Context, fileID string) (FileInfo, error) {
 	args := m.Called(ctx, fileID)
-	return args.String(0), args.Error(1)
+	return args.Get(0).(FileInfo), args.Error(1)
 }
 
 func (m *MockRepository) DeleteFile(ctx context.Context, userID string, fileID string) error {
@@ -261,16 +261,17 @@ func TestStorageService_DownloadFile(t *testing.T) {
 	hashStr := hex.EncodeToString(hashBytes[:])
 
 	mockRepo.On("VerifyFileOwnership", mock.Anything, userID, fileID).Return(nil)
-	mockRepo.On("GetFileContentType", mock.Anything, fileID).Return("text/plain", nil)
+	mockRepo.On("GetFileInfo", mock.Anything, fileID).Return(FileInfo{Name: "doc.txt", ContentType: "text/plain"}, nil)
 	mockRepo.On("GetFileChunks", mock.Anything, fileID).Return([]Chunk{
 		{ID: "c1", Hash: hashStr, Size: int64(len(content))},
 	}, nil)
 
 	mockStore.On("DownloadChunk", mock.Anything, hashStr).Return(io.NopCloser(bytes.NewReader(content)), nil)
 
-	reader, contentType, err := svc.DownloadFile(context.Background(), userID, fileID)
+	reader, info, err := svc.DownloadFile(context.Background(), userID, fileID)
 	assert.NoError(t, err)
-	assert.Equal(t, "text/plain", contentType)
+	assert.Equal(t, "text/plain", info.ContentType)
+	assert.Equal(t, "doc.txt", info.Name)
 
 	readContent, err := io.ReadAll(reader)
 	assert.NoError(t, err)
@@ -303,7 +304,7 @@ func TestStorageService_DownloadFile_RejectsCorruptChunkBeforeYieldingData(t *te
 	corrupted := &trackedCloser{Reader: bytes.NewReader([]byte("tampered content"))}
 
 	mockRepo.On("VerifyFileOwnership", mock.Anything, userID, fileID).Return(nil)
-	mockRepo.On("GetFileContentType", mock.Anything, fileID).Return("text/plain", nil)
+	mockRepo.On("GetFileInfo", mock.Anything, fileID).Return(FileInfo{Name: "doc.txt", ContentType: "text/plain"}, nil)
 	mockRepo.On("GetFileChunks", mock.Anything, fileID).Return([]Chunk{
 		{ID: "c1", Hash: expectedHash, Size: 16},
 	}, nil)
@@ -329,7 +330,7 @@ func TestStorageService_DownloadFile_DoesNotOpenChunksUntilRead(t *testing.T) {
 	fileID := "file-123"
 
 	mockRepo.On("VerifyFileOwnership", mock.Anything, userID, fileID).Return(nil)
-	mockRepo.On("GetFileContentType", mock.Anything, fileID).Return("text/plain", nil)
+	mockRepo.On("GetFileInfo", mock.Anything, fileID).Return(FileInfo{Name: "doc.txt", ContentType: "text/plain"}, nil)
 	mockRepo.On("GetFileChunks", mock.Anything, fileID).Return([]Chunk{
 		{ID: "c1", Hash: "hash-1", Size: 4},
 		{ID: "c2", Hash: "hash-2", Size: 4},
