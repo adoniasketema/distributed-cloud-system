@@ -271,6 +271,72 @@ func TestStorageService_DownloadFile(t *testing.T) {
 	assert.Equal(t, string(content), string(readContent))
 }
 
+// trackedCloser records whether Close was called, so we can assert object handles are
+// not leaked when a download is abandoned or fails verification.
+type trackedCloser struct {
+	io.Reader
+	closed bool
+}
+
+func (t *trackedCloser) Close() error {
+	t.closed = true
+	return nil
+}
+
+func TestStorageService_DownloadFile_RejectsCorruptChunkBeforeYieldingData(t *testing.T) {
+	mockRepo := new(MockRepository)
+	mockStore := new(MockObjectStore)
+	svc := NewService(mockRepo, mockStore, nil)
+
+	userID := "user-123"
+	fileID := "file-123"
+
+	// The stored bytes do not match the hash the chunk is addressed by.
+	expected := sha256.Sum256([]byte("original content"))
+	expectedHash := hex.EncodeToString(expected[:])
+	corrupted := &trackedCloser{Reader: bytes.NewReader([]byte("tampered content"))}
+
+	mockRepo.On("VerifyFileOwnership", mock.Anything, userID, fileID).Return(nil)
+	mockRepo.On("GetFileContentType", mock.Anything, fileID).Return("text/plain", nil)
+	mockRepo.On("GetFileChunks", mock.Anything, fileID).Return([]Chunk{
+		{ID: "c1", Hash: expectedHash, Size: 16},
+	}, nil)
+	mockStore.On("DownloadChunk", mock.Anything, expectedHash).Return(corrupted, nil)
+
+	reader, _, err := svc.DownloadFile(context.Background(), userID, fileID)
+	assert.NoError(t, err)
+
+	got, err := io.ReadAll(reader)
+	assert.Error(t, err, "corrupt chunk must surface an error")
+	assert.Contains(t, err.Error(), "integrity check failed")
+	// The critical property: not one tampered byte was handed to the caller.
+	assert.Empty(t, got)
+	assert.True(t, corrupted.closed, "chunk handle must be closed")
+}
+
+func TestStorageService_DownloadFile_DoesNotOpenChunksUntilRead(t *testing.T) {
+	mockRepo := new(MockRepository)
+	mockStore := new(MockObjectStore)
+	svc := NewService(mockRepo, mockStore, nil)
+
+	userID := "user-123"
+	fileID := "file-123"
+
+	mockRepo.On("VerifyFileOwnership", mock.Anything, userID, fileID).Return(nil)
+	mockRepo.On("GetFileContentType", mock.Anything, fileID).Return("text/plain", nil)
+	mockRepo.On("GetFileChunks", mock.Anything, fileID).Return([]Chunk{
+		{ID: "c1", Hash: "hash-1", Size: 4},
+		{ID: "c2", Hash: "hash-2", Size: 4},
+		{ID: "c3", Hash: "hash-3", Size: 4},
+	}, nil)
+
+	_, _, err := svc.DownloadFile(context.Background(), userID, fileID)
+	assert.NoError(t, err)
+
+	// A download that is built but never read must not have opened a single object handle.
+	mockStore.AssertNotCalled(t, "DownloadChunk", mock.Anything, mock.Anything)
+}
+
 func TestStorageService_RunGarbageCollection(t *testing.T) {
 	mockRepo := new(MockRepository)
 	mockStore := new(MockObjectStore)

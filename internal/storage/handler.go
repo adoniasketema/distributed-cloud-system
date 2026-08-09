@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"io"
@@ -94,10 +95,21 @@ func (h *Handler) DownloadFile(w http.ResponseWriter, r *http.Request) {
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
+
+	// Pull the first byte before committing a status code. Chunks are integrity-checked when
+	// they are first read, so this turns a corrupt or missing first chunk into an honest 500
+	// instead of a 200 followed by a truncated body. Peeked bytes are replayed by io.Copy.
+	buffered := bufio.NewReader(reader)
+	if _, err := buffered.Peek(1); err != nil && err != io.EOF {
+		tracing.Logger(r.Context()).Error("download failed before streaming", "error", err, "file_id", fileID, "user_id", userID)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(http.StatusOK)
 
-	_, err = io.Copy(w, reader)
+	_, err = io.Copy(w, buffered)
 	if err != nil {
 		tracing.Logger(r.Context()).Error("error streaming file to client", "error", err, "file_id", fileID, "user_id", userID)
 	} else {

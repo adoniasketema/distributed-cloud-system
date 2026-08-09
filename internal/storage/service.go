@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"hash"
 	"io"
 	"log"
 	"net/http"
@@ -44,37 +43,64 @@ func NewService(repo Repository, store ObjectStore, publisher events.Publisher) 
 	}
 }
 
-type integrityCheckingReader struct {
-	r         io.Reader
-	expected  string
-	hasher    hash.Hash
-	err       error
+// verifiedChunkReader streams a single content-addressed chunk.
+//
+// It fetches the chunk on first Read (not at construction time), so building a reader for an
+// N-chunk file opens exactly one object handle at a time instead of N — and that handle is
+// closed before any bytes are handed back, so an abandoned download leaks nothing.
+//
+// The whole chunk is buffered and its SHA-256 checked against the expected hash *before* any
+// byte is returned. Verifying up front is what makes the check useful: a streaming hash can
+// only report corruption after the caller has already received and written out the bad data.
+// Chunks are bounded at ChunkSize, so this costs at most one chunk of memory per active read.
+type verifiedChunkReader struct {
+	store    ObjectStore
+	ctx      context.Context
+	expected string
+	buf      *bytes.Reader
+	err      error
 }
 
-func newIntegrityCheckingReader(r io.Reader, expectedHash string) io.Reader {
-	return &integrityCheckingReader{
-		r:        r,
-		expected: expectedHash,
-		hasher:   sha256.New(),
-	}
+func newVerifiedChunkReader(ctx context.Context, store ObjectStore, expectedHash string) io.Reader {
+	return &verifiedChunkReader{ctx: ctx, store: store, expected: expectedHash}
 }
 
-func (i *integrityCheckingReader) Read(p []byte) (int, error) {
-	if i.err != nil {
-		return 0, i.err
+func (v *verifiedChunkReader) Read(p []byte) (int, error) {
+	if v.err != nil {
+		return 0, v.err
 	}
-	n, err := i.r.Read(p)
-	if n > 0 {
-		i.hasher.Write(p[:n])
-	}
-	if err == io.EOF {
-		sum := hex.EncodeToString(i.hasher.Sum(nil))
-		if sum != i.expected {
-			i.err = fmt.Errorf("chunk integrity check failed: expected hash %s got %s", i.expected, sum)
-			return n, i.err
+	if v.buf == nil {
+		if err := v.load(); err != nil {
+			v.err = err
+			return 0, err
 		}
 	}
-	return n, err
+	return v.buf.Read(p)
+}
+
+func (v *verifiedChunkReader) load() error {
+	rc, err := v.store.DownloadChunk(v.ctx, v.expected)
+	if err != nil {
+		return fmt.Errorf("failed to download chunk %s: %w", v.expected, err)
+	}
+	defer rc.Close()
+
+	// Read one byte past the limit so an oversized object is detected rather than truncated.
+	data, err := io.ReadAll(io.LimitReader(rc, ChunkSize+1))
+	if err != nil {
+		return fmt.Errorf("failed to read chunk %s: %w", v.expected, err)
+	}
+	if len(data) > ChunkSize {
+		return fmt.Errorf("chunk %s exceeds maximum chunk size", v.expected)
+	}
+
+	sum := sha256.Sum256(data)
+	if got := hex.EncodeToString(sum[:]); got != v.expected {
+		return fmt.Errorf("chunk integrity check failed: expected hash %s got %s", v.expected, got)
+	}
+
+	v.buf = bytes.NewReader(data)
+	return nil
 }
 
 func (s *service) UploadFile(ctx context.Context, userID string, folderID *string, name string, fileReader io.Reader) (string, error) {
@@ -185,14 +211,11 @@ func (s *service) DownloadFile(ctx context.Context, userID string, fileID string
 		return nil, "", fmt.Errorf("failed to get file chunks: %w", err)
 	}
 
-	var readers []io.Reader
+	// Readers are lazy: each chunk is fetched and integrity-checked only when the client
+	// actually reads that far, so nothing is opened for a download that is never consumed.
+	readers := make([]io.Reader, 0, len(chunks))
 	for _, chunk := range chunks {
-		reader, err := s.store.DownloadChunk(ctx, chunk.Hash)
-		if err != nil {
-			return nil, "", fmt.Errorf("failed to download chunk %s: %w", chunk.Hash, err)
-		}
-		// Wrap with on-the-fly SHA-256 integrity verification
-		readers = append(readers, newIntegrityCheckingReader(reader, chunk.Hash))
+		readers = append(readers, newVerifiedChunkReader(ctx, s.store, chunk.Hash))
 	}
 
 	// Combine all chunk streams sequentially
@@ -215,14 +238,9 @@ func (s *service) DownloadFileInternal(ctx context.Context, fileID string) (io.R
 		return nil, fmt.Errorf("failed to get file chunks: %w", err)
 	}
 
-	var readers []io.Reader
+	readers := make([]io.Reader, 0, len(chunks))
 	for _, chunk := range chunks {
-		reader, err := s.store.DownloadChunk(ctx, chunk.Hash)
-		if err != nil {
-			return nil, fmt.Errorf("failed to download chunk %s: %w", chunk.Hash, err)
-		}
-		// Wrap with integrity check
-		readers = append(readers, newIntegrityCheckingReader(reader, chunk.Hash))
+		readers = append(readers, newVerifiedChunkReader(ctx, s.store, chunk.Hash))
 	}
 
 	return io.MultiReader(readers...), nil
