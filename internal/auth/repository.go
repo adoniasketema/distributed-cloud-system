@@ -6,10 +6,15 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var ErrUserNotFound = errors.New("user not found")
+var (
+	ErrUserNotFound = errors.New("user not found")
+	// ErrEmailTaken means the users.email unique constraint rejected the insert.
+	ErrEmailTaken = errors.New("email already registered")
+)
 
 // User represents a user in the database
 type User struct {
@@ -47,6 +52,15 @@ func (r *repository) CreateUser(ctx context.Context, email, passwordHash string)
 	)
 
 	if err != nil {
+		// The unique index on users.email is the authority on whether an address is free.
+		// Checking first and inserting second would leave a window for two concurrent
+		// registrations of the same address, so let the constraint decide and translate
+		// its error. Matching SQLSTATE 23505 rather than the message text, which is
+		// driver- and locale-dependent.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return nil, ErrEmailTaken
+		}
 		return nil, err
 	}
 

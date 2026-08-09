@@ -17,13 +17,19 @@ type Service interface {
 type service struct {
 	repo   Repository
 	apiKey string
+	model  string
 	apiURL string
 }
 
-func NewService(repo Repository, apiKey string) Service {
+// NewService builds the enrichment client. The model is configuration rather than a
+// constant: OpenRouter's catalogue changes, model IDs are account-dependent, and a
+// hardcoded ID that has been retired fails at request time on every upload with nothing
+// in the code to suggest why.
+func NewService(repo Repository, apiKey, model string) Service {
 	return &service{
 		repo:   repo,
 		apiKey: apiKey,
+		model:  model,
 		apiURL: "https://openrouter.ai/api/v1/chat/completions",
 	}
 }
@@ -32,6 +38,9 @@ func (s *service) GenerateAndSaveEmbedding(ctx context.Context, fileID string, c
 	if s.apiKey == "" {
 		return fmt.Errorf("OpenRouter API key is not configured")
 	}
+	if s.model == "" {
+		return fmt.Errorf("OPENROUTER_MODEL is not configured: set it to a model id available on your account (see https://openrouter.ai/models)")
+	}
 
 	// Truncate content to avoid massive token usage on large files
 	if len(content) > 5000 {
@@ -39,7 +48,7 @@ func (s *service) GenerateAndSaveEmbedding(ctx context.Context, fileID string, c
 	}
 
 	reqBody := map[string]interface{}{
-		"model": "google/gemma-4-26b-a4b-it:free",
+		"model": s.model,
 		"messages": []map[string]string{
 			{
 				"role":    "system",

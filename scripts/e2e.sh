@@ -13,6 +13,14 @@ echo "[BUILD] Compiling API server and worker binaries..."
 go build -o api_server ./cmd/api
 go build -o worker_server ./cmd/worker
 
+# The API refuses to start without a strong JWT_SECRET. Generate a throwaway one per run so
+# the suite never depends on a checked-in key and never reuses a developer's real key.
+export JWT_SECRET="${JWT_SECRET:-$(openssl rand -base64 48)}"
+
+# The suite queries tables directly, so the schema has to exist before the servers start.
+echo "[MIGRATE] Applying database migrations..."
+make migrate
+
 echo "[INFO] Launching HTTP API service on port 8080..."
 ./api_server &
 API_PID=$!

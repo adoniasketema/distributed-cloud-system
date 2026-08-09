@@ -17,6 +17,17 @@ const (
 	StreamName       = "nimbus:events"
 	DeadLetterStream = "nimbus:dead-letters"
 	ConsumerGroup    = "nimbus-workers"
+
+	// readBatchSize is how many messages a single XReadGroup may return. Messages are still
+	// processed one at a time; batching only saves round trips when a backlog exists.
+	readBatchSize = 10
+
+	// Transient read failures are retried with exponential backoff before Consume gives up
+	// and lets the process exit. At these values the worker tolerates roughly a minute of
+	// broker unavailability, which covers a restart or failover.
+	maxConsumeFailures = 8
+	baseConsumeBackoff = 250 * time.Millisecond
+	maxConsumeBackoff  = 15 * time.Second
 )
 
 type Publisher interface {
@@ -57,6 +68,12 @@ func (r *redisBroker) Ping(ctx context.Context) error {
 	return r.client.Ping(ctx).Err()
 }
 
+// Client exposes the underlying connection so other components that need Redis - the
+// cross-replica rate limiter, for one - can reuse this pool rather than opening their own.
+func (r *redisBroker) Client() *redis.Client {
+	return r.client
+}
+
 func (r *redisBroker) PublishFileUploaded(ctx context.Context, fileID string) error {
 	return r.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: StreamName,
@@ -87,39 +104,90 @@ func (r *redisBroker) Consume(ctx context.Context, handler func(ctx context.Cont
 	ticker := time.NewTicker(3 * time.Minute)
 	defer ticker.Stop()
 
+	// consecutiveFailures drives the reconnect backoff below.
+	var consecutiveFailures int
+
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+
+		// Reclaiming is checked between reads rather than as a select case. Sharing a
+		// select with the read meant the branches competed: whichever was ready won, so
+		// under a steady message flow the reclaim tick could be passed over indefinitely.
+		select {
 		case <-ticker.C:
 			r.claimAndProcessStaleMessages(ctx, consumerName, handler)
 		default:
-			// Read new messages from the stream, block for 2 seconds
-			streams, err := r.client.XReadGroup(ctx, &redis.XReadGroupArgs{
-				Group:    ConsumerGroup,
-				Consumer: consumerName,
-				Streams:  []string{StreamName, ">"},
-				Count:    1,
-				Block:    2 * time.Second,
-			}).Result()
+		}
 
-			if errors.Is(err, redis.Nil) {
-				// No messages received within block duration, continue loop
-				continue
-			} else if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return nil
-				}
-				return fmt.Errorf("redis consume error: %w", err)
+		// Read new messages from the stream, block for 2 seconds
+		streams, err := r.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    ConsumerGroup,
+			Consumer: consumerName,
+			Streams:  []string{StreamName, ">"},
+			Count:    readBatchSize,
+			Block:    2 * time.Second,
+		}).Result()
+
+		switch {
+		case errors.Is(err, redis.Nil):
+			// No messages received within block duration, continue loop
+			consecutiveFailures = 0
+			continue
+		case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+			return nil
+		case err != nil:
+			// A read failure is usually Redis being restarted, failed over, or briefly
+			// unreachable - all of which recover on their own. Returning here would exit
+			// Consume, and the worker's main treats that as fatal, so a blip that Redis
+			// recovers from in seconds would take the worker down with it. Back off and
+			// retry instead, and only give up once it is clear the broker is not coming
+			// back.
+			consecutiveFailures++
+			if consecutiveFailures >= maxConsumeFailures {
+				return fmt.Errorf("redis consume error after %d consecutive attempts: %w", consecutiveFailures, err)
 			}
+			backoff := consumeBackoff(consecutiveFailures)
+			slog.Warn("redis read failed, retrying",
+				"error", err, "attempt", consecutiveFailures, "max_attempts", maxConsumeFailures, "backoff", backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil
+			}
+			continue
+		}
 
-			for _, stream := range streams {
-				for _, msg := range stream.Messages {
-					r.handleMessageWithRetry(ctx, msg, handler)
-				}
+		consecutiveFailures = 0
+		for _, stream := range streams {
+			for _, msg := range stream.Messages {
+				r.handleMessageWithRetry(ctx, msg, handler)
 			}
 		}
 	}
+}
+
+// consumeBackoff returns the delay before retrying a failed stream read, doubling per
+// attempt and capped so a long outage does not stretch the retry interval without bound.
+func consumeBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		return baseConsumeBackoff
+	}
+
+	// Bound the shift before performing it. A large attempt count would overflow the
+	// duration and wrap negative, and a negative delay makes time.After fire immediately -
+	// turning the backoff into the hot retry loop it exists to prevent.
+	const maxShift = 32
+	if attempt-1 > maxShift {
+		return maxConsumeBackoff
+	}
+
+	backoff := baseConsumeBackoff << (attempt - 1)
+	if backoff <= 0 || backoff > maxConsumeBackoff {
+		return maxConsumeBackoff
+	}
+	return backoff
 }
 
 func (r *redisBroker) handleMessageWithRetry(ctx context.Context, msg redis.XMessage, handler func(ctx context.Context, fileID string) error) {

@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"nimbus/internal/auth"
 )
 
 type contextKey string
@@ -31,29 +33,26 @@ func AuthMiddleware(jwtSecret string) func(http.Handler) http.Handler {
 
 			tokenString := parts[1]
 
-			// Parse and validate the token
-			token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-				// Validate the alg is what you expect
-				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-					return nil, jwt.ErrSignatureInvalid
-				}
-				return []byte(jwtSecret), nil
-			})
+			// Parse into the same typed claims the issuer produced, so there is no
+			// interface{} type assertion that can silently fail. WithValidMethods pins the
+			// accepted algorithm before the key function runs, which is what rejects a token
+			// re-presented as "none" or under an asymmetric algorithm.
+			claims := &auth.Claims{}
+			token, err := jwt.ParseWithClaims(
+				tokenString,
+				claims,
+				func(token *jwt.Token) (interface{}, error) { return []byte(jwtSecret), nil },
+				jwt.WithValidMethods([]string{auth.SigningMethod.Alg()}),
+			)
 
+			// Expiry is checked by the parser, so err covers expired tokens too.
 			if err != nil || !token.Valid {
 				http.Error(w, "invalid or expired token", http.StatusUnauthorized)
 				return
 			}
 
-			// Extract claims
-			claims, ok := token.Claims.(jwt.MapClaims)
-			if !ok {
-				http.Error(w, "invalid token claims", http.StatusUnauthorized)
-				return
-			}
-
-			userIDStr, ok := claims["sub"].(string)
-			if !ok || userIDStr == "" {
+			userIDStr := claims.UserID()
+			if userIDStr == "" {
 				http.Error(w, "missing user id in token", http.StatusUnauthorized)
 				return
 			}

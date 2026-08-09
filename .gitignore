@@ -3,11 +3,13 @@
 *.local
 
 # Compiled binaries and directories
+# Anchored to the repository root: an unanchored name matches at any depth, so a bare
+# "api" also matched the cmd/api/ source directory and silently excluded it from the repo.
 /bin/
-api_server
-worker_server
-infra_check
-api
+/api_server
+/worker_server
+/infra_check
+/api
 
 # Test and runtime artifacts
 dummy_upload.txt

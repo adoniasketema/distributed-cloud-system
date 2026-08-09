@@ -32,7 +32,7 @@ func main() {
 	slog.Info("starting nimbus background worker...")
 
 	// 1. Initialize Infrastructure
-	dbPool, err := database.New(cfg.DatabaseURL)
+	dbPool, err := database.New(cfg.DatabaseURL, cfg.DBMaxConns)
 	if err != nil {
 		slog.Error("unable to connect to database", "error", err)
 		os.Exit(1)
@@ -56,7 +56,7 @@ func main() {
 	storageSvc := storage.NewService(storageRepo, minioClient, nil)
 
 	aiRepo := ai.NewRepository(dbPool)
-	aiSvc := ai.NewService(aiRepo, cfg.OpenRouterAPIKey)
+	aiSvc := ai.NewService(aiRepo, cfg.OpenRouterAPIKey, cfg.OpenRouterModel)
 
 	// 3. Initialize Processor
 	processor := worker.NewProcessor(storageSvc, aiSvc)

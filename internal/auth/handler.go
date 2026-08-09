@@ -2,6 +2,7 @@ package auth
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"nimbus/internal/tracing"
@@ -27,11 +28,25 @@ type authResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
+// decodeRequest reads the JSON body, distinguishing a body that exceeded the configured
+// limit (413) from one that is merely malformed (400).
+func (h *Handler) decodeRequest(w http.ResponseWriter, r *http.Request, dst *authRequest) bool {
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			h.respondError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return false
+		}
+		h.respondError(w, http.StatusBadRequest, "invalid request body")
+		return false
+	}
+	return true
+}
+
 // Register handles user registration
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	var req authRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondError(w, http.StatusBadRequest, "invalid request body")
+	if !h.decodeRequest(w, r, &req) {
 		return
 	}
 
@@ -42,6 +57,12 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 
 	_, err := h.svc.Register(r.Context(), req.Email, req.Password)
 	if err != nil {
+		// A taken address is an expected outcome of a valid request, not a server fault,
+		// so it gets 409 and does not pollute the error log.
+		if errors.Is(err, ErrEmailTaken) {
+			h.respondError(w, http.StatusConflict, "email already registered")
+			return
+		}
 		tracing.Logger(r.Context()).Error("user registration failed", "error", err, "email", req.Email)
 		h.respondError(w, http.StatusInternalServerError, "failed to register user")
 		return
@@ -55,8 +76,7 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 // Login handles user login and JWT issuance
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	var req authRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondError(w, http.StatusBadRequest, "invalid request body")
+	if !h.decodeRequest(w, r, &req) {
 		return
 	}
 

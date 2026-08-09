@@ -1,4 +1,8 @@
-.PHONY: build test e2e check-infra dev-up dev-down clean
+.PHONY: build test e2e check-infra dev-up dev-down migrate migrate-down clean
+
+# Connection string used by the migration targets. Override to point at another database:
+#   make migrate DATABASE_URL=postgres://...
+DATABASE_URL ?= postgres://nimbus:password@localhost:5432/nimbus_db?sslmode=disable
 
 # Default target executes unit test verification followed by binary compilation
 all: test build
@@ -16,6 +20,17 @@ build:
 test:
 	@echo "[TEST] Executing unit test suite..."
 	go test -count=1 ./...
+
+# Apply database migrations. Uses goose via `go run` so it does not become a build
+# dependency of the application itself.
+migrate:
+	@echo "[MIGRATE] Applying database migrations..."
+	go run github.com/pressly/goose/v3/cmd/goose@latest -dir migrations postgres "$(DATABASE_URL)" up
+
+# Roll back the most recent migration
+migrate-down:
+	@echo "[MIGRATE] Rolling back most recent migration..."
+	go run github.com/pressly/goose/v3/cmd/goose@latest -dir migrations postgres "$(DATABASE_URL)" down
 
 # Run live end-to-end integration test suite against running Docker infrastructure
 e2e:

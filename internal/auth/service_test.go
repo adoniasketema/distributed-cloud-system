@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -39,7 +41,7 @@ func TestAuthService_Register(t *testing.T) {
 	email := "test@example.com"
 	password := "password123"
 
-	// We expect CreateUser to be called. We use mock.Anything for the passwordHash 
+	// We expect CreateUser to be called. We use mock.Anything for the passwordHash
 	// because it's randomly salted bcrypt.
 	mockRepo.On("CreateUser", mock.Anything, email, mock.Anything).Return(&User{
 		ID:    "123",
@@ -55,6 +57,22 @@ func TestAuthService_Register(t *testing.T) {
 	mockRepo.AssertExpectations(t)
 }
 
+func TestAuthService_Register_PropagatesEmailTaken(t *testing.T) {
+	mockRepo := new(MockUserRepository)
+	svc := NewService(mockRepo, "test-secret")
+
+	email := "taken@example.com"
+	mockRepo.On("CreateUser", mock.Anything, email, mock.Anything).Return((*User)(nil), ErrEmailTaken)
+
+	user, err := svc.Register(context.Background(), email, "password123")
+
+	// The handler distinguishes this from a server fault to answer 409, so the sentinel
+	// must survive the service layer unwrapped.
+	assert.ErrorIs(t, err, ErrEmailTaken)
+	assert.Nil(t, user)
+	mockRepo.AssertExpectations(t)
+}
+
 func TestAuthService_Login(t *testing.T) {
 	mockRepo := new(MockUserRepository)
 	secret := "test-secret"
@@ -62,7 +80,7 @@ func TestAuthService_Login(t *testing.T) {
 
 	email := "test@example.com"
 	password := "password123"
-	
+
 	// Create a valid bcrypt hash for the test password
 	hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
 
@@ -79,16 +97,25 @@ func TestAuthService_Login(t *testing.T) {
 	assert.NotEmpty(t, token)
 
 	// Verify the token
-	parsedToken, err := jwt.Parse(token, func(t *jwt.Token) (interface{}, error) {
+	claims := &Claims{}
+	parsedToken, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (interface{}, error) {
 		return []byte(secret), nil
 	})
 	assert.NoError(t, err)
 	assert.True(t, parsedToken.Valid)
-	
-	claims := parsedToken.Claims.(jwt.MapClaims)
-	assert.Equal(t, "123", claims["sub"])
-	assert.Equal(t, email, claims["email"])
-	
+
+	assert.Equal(t, "123", claims.UserID())
+	assert.Equal(t, email, claims.Email)
+	assert.Equal(t, SigningMethod.Alg(), parsedToken.Method.Alg())
+
+	// The subject must survive the JSON round trip as a string; this is the assertion that
+	// would have caught a numeric user ID silently arriving as float64.
+	assert.IsType(t, "", claims.Subject)
+
+	require.NotNil(t, claims.ExpiresAt)
+	require.NotNil(t, claims.IssuedAt)
+	assert.WithinDuration(t, claims.IssuedAt.Add(TokenTTL), claims.ExpiresAt.Time, time.Second)
+
 	mockRepo.AssertExpectations(t)
 }
 
@@ -97,7 +124,7 @@ func TestAuthService_Login_InvalidCredentials(t *testing.T) {
 	svc := NewService(mockRepo, "test-secret")
 
 	email := "test@example.com"
-	
+
 	// Return user not found
 	mockRepo.On("GetUserByEmail", mock.Anything, email).Return((*User)(nil), errors.New("user not found"))
 
