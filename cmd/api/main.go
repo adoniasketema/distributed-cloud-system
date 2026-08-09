@@ -35,6 +35,13 @@ func main() {
 	// Load configuration from environment
 	cfg := config.Load()
 
+	// Refuse to start rather than fall back to a weak signing key: a server that boots with
+	// a guessable JWT secret accepts forged tokens for every account, and does so silently.
+	if err := cfg.ValidateForAPI(); err != nil {
+		slog.Error("invalid configuration", "error", err)
+		os.Exit(1)
+	}
+
 	// 1. Initialize Infrastructure
 	dbPool, err := database.New(cfg.DatabaseURL)
 	if err != nil {

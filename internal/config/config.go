@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strings"
 )
@@ -46,12 +47,45 @@ func Load() *Config {
 		MinIOUseSSL:      getEnv("MINIO_USE_SSL", "false") == "true",
 		RedisAddr:        getEnv("REDIS_ADDR", "localhost:6379"),
 		RedisPassword:    getEnv("REDIS_PASSWORD", ""),
-		JWTSecret:        getEnv("JWT_SECRET", "change-me-in-production-use-a-long-random-string"),
+		// Deliberately no fallback. A default signing key that ships in the repository is
+		// a published secret: anyone who reads it can forge a token for any user, and the
+		// service would start silently rather than telling you.
+		JWTSecret:        os.Getenv("JWT_SECRET"),
 		APIPort:          getEnv("API_PORT", "8080"),
 		OpenRouterAPIKey: getEnv("OPEN_ROUTER_API_KEY", ""),
 
 		TrustedProxyCIDRs: getEnvList("TRUSTED_PROXY_CIDRS"),
 	}
+}
+
+// MinJWTSecretLength is the shortest signing key accepted. HS256 keys should carry at least
+// as much entropy as the hash they feed, so anything under 256 bits is rejected.
+const MinJWTSecretLength = 32
+
+// knownInsecureJWTSecrets are placeholder values that have appeared in this repository's
+// documentation. They are public, so they must never be accepted as a real key however long
+// they are - copying the example verbatim is the most likely way to end up insecure.
+var knownInsecureJWTSecrets = map[string]bool{
+	"change-me-in-production-use-a-long-random-string": true,
+	"changeme": true,
+	"secret":   true,
+}
+
+// ValidateForAPI checks the settings the API server cannot safely start without.
+//
+// It is separate from Load, and separate from the worker's requirements, because the worker
+// and the infra checker do not sign or verify tokens and should not be made to supply a key
+// they never use.
+func (c *Config) ValidateForAPI() error {
+	switch {
+	case c.JWTSecret == "":
+		return fmt.Errorf("JWT_SECRET is required: generate one with `openssl rand -base64 48`")
+	case knownInsecureJWTSecrets[strings.ToLower(strings.TrimSpace(c.JWTSecret))]:
+		return fmt.Errorf("JWT_SECRET is set to a placeholder from this repository's docs and is therefore public: generate one with `openssl rand -base64 48`")
+	case len(c.JWTSecret) < MinJWTSecretLength:
+		return fmt.Errorf("JWT_SECRET must be at least %d characters, got %d: generate one with `openssl rand -base64 48`", MinJWTSecretLength, len(c.JWTSecret))
+	}
+	return nil
 }
 
 // getEnvList reads a comma-separated environment variable into a slice, dropping empty
