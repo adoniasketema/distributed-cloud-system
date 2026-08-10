@@ -202,7 +202,10 @@ func (r *repository) SearchFiles(ctx context.Context, userID string, searchQuery
 		WHERE f.user_id = $1
 		  AND f.status = 'ready'
 		  AND (f.name ILIKE '%' || $3 || '%'
-		       OR fe.embedding @> json_build_object('tags', json_build_array($2))::jsonb
+		       -- $2 is cast explicitly: json_build_array is polymorphic, so it gives the
+		       -- planner nothing to infer a parameter type from, and an uncast $2 fails
+		       -- with 42P18 rather than at any point a unit test would notice.
+		       OR fe.embedding @> json_build_object('tags', json_build_array($2::text))::jsonb
 		       OR fe.embedding->>'summary' ILIKE '%' || $3 || '%'
 		       OR (fe.embedding->'tags')::text ILIKE '%' || $3 || '%')
 		ORDER BY f.created_at DESC, f.id

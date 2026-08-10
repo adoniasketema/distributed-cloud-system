@@ -1,4 +1,4 @@
-.PHONY: build test e2e check-infra dev-up dev-down migrate migrate-down clean
+.PHONY: build test test-integration e2e check-infra dev-up dev-down migrate migrate-down clean
 
 # Connection string used by the migration targets. Override to point at another database:
 #   make migrate DATABASE_URL=postgres://...
@@ -31,6 +31,12 @@ migrate:
 migrate-down:
 	@echo "[MIGRATE] Rolling back most recent migration..."
 	go run github.com/pressly/goose/v3/cmd/goose@latest -dir migrations postgres "$(DATABASE_URL)" down
+
+# Run repository tests against a real PostgreSQL instance. Requires `make dev-up` and
+# `make migrate` first; the suite skips itself if no database is reachable.
+test-integration:
+	@echo "[TEST] Executing integration suite against live PostgreSQL..."
+	go test -count=1 -tags=integration ./internal/integration/...
 
 # Run live end-to-end integration test suite against running Docker infrastructure
 e2e:

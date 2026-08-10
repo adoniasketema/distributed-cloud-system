@@ -56,6 +56,11 @@ func (h *Handler) UploadFile(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "folder not found or access denied", http.StatusForbidden)
 			return
 		}
+		if errors.Is(err, ErrDuplicateName) {
+			// An expected outcome of a valid request, not a server fault.
+			http.Error(w, "a file with this name already exists in this directory", http.StatusConflict)
+			return
+		}
 		tracing.Logger(r.Context()).Error("upload file service failed", "error", err, "filename", header.Filename, "user_id", userID)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
