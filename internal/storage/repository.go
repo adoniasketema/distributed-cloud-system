@@ -17,6 +17,8 @@ var (
 	// ErrChunkInUse means a chunk gained a reference since it was listed as orphaned,
 	// so the garbage collector must leave it alone.
 	ErrChunkInUse = errors.New("chunk is no longer orphaned")
+	// ErrDuplicateName means a file of that name already exists in the target directory.
+	ErrDuplicateName = errors.New("a file with this name already exists in this directory")
 )
 
 type Chunk struct {
@@ -98,9 +100,20 @@ func (r *repository) CreateFile(ctx context.Context, userID string, folderID *st
 	var fileID string
 	err := r.db.QueryRow(ctx, query, userID, folderID, name, contentType, size, StatusUploading).Scan(&fileID)
 	if err != nil {
+		// Rejected up front, before any bytes are streamed, rather than after the upload.
+		if isUniqueViolation(err) {
+			return "", ErrDuplicateName
+		}
 		return "", err
 	}
 	return fileID, nil
+}
+
+// isUniqueViolation reports whether err is PostgreSQL's 23505. Matched on SQLSTATE rather
+// than message text, which is driver- and locale-dependent.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 func (r *repository) GetFileInfo(ctx context.Context, fileID string) (FileInfo, error) {

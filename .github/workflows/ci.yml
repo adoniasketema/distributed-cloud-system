@@ -52,6 +52,57 @@ jobs:
       - name: Build binaries
         run: make build
 
+  integration:
+    name: Integration tests (real PostgreSQL)
+    runs-on: ubuntu-latest
+
+    # The unit suite mocks every repository, so it validates how services call the database
+    # but never whether the SQL is valid. Two bugs got past it: a parameter PostgreSQL could
+    # not type, and a UNIQUE constraint that never fired at the root because SQL treats NULLs
+    # as distinct. Both are invisible without a real server.
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: nimbus
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: nimbus_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nimbus -d nimbus_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgres://nimbus:password@localhost:5432/nimbus_db?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Runs against a database built only from the migration files, so a migration that is
+      # broken or out of order fails here rather than on a developer's already-migrated
+      # database where it would never be re-applied.
+      - name: Apply migrations
+        run: make migrate DATABASE_URL="$TEST_DATABASE_URL"
+
+      - name: Run integration tests
+        run: make test-integration
+
+      # Proves the down migrations are correct, which is otherwise never exercised: a
+      # rollback is only ever run in an incident, which is the worst time to discover it
+      # does not work.
+      - name: Verify migrations roll back and re-apply
+        run: |
+          go run github.com/pressly/goose/v3/cmd/goose@latest -dir migrations postgres "$TEST_DATABASE_URL" reset
+          make migrate DATABASE_URL="$TEST_DATABASE_URL"
+
   verify-committed:
     name: Verify no source is excluded from the repository
     runs-on: ubuntu-latest
